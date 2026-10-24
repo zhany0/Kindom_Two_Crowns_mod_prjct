@@ -1,0 +1,13 @@
+D:\KingdomMod\BetterKingdom project\bin\Debug\net6.0\BetterKingdom.deps.json
+D:\KingdomMod\BetterKingdom project\bin\Debug\net6.0\BetterKingdom.dll
+D:\KingdomMod\BetterKingdom project\bin\Debug\net6.0\BetterKingdom.pdb
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\BetterKingdom.csproj.AssemblyReference.cache
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\PluginInfo.cs
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\BetterKingdom.GeneratedMSBuildEditorConfig.editorconfig
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\BetterKingdom.AssemblyInfoInputs.cache
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\BetterKingdom.AssemblyInfo.cs
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\BetterKingdom.csproj.CoreCompileInputs.cache
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\BetterKingdom.dll
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\refint\BetterKingdom.dll
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\BetterKingdom.pdb
+D:\KingdomMod\BetterKingdom project\obj\Debug\net6.0\ref\BetterKingdom.dll

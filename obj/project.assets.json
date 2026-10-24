@@ -1,0 +1,96 @@
+{
+  "version": 3,
+  "targets": {
+    "net6.0": {
+      "BepInEx.PluginInfoProps/1.1.0": {
+        "type": "package",
+        "build": {
+          "build/BepInEx.PluginInfoProps.props": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "BepInEx.PluginInfoProps/1.1.0": {
+      "sha512": "RqM3aaGs8Hc2m0D+8aSt9mv09rCMYNIF35NB3D6KA2zSpcXJh/9ZVWrPlIUJfA8KYzodSWcCMUexEW24fjwR3w==",
+      "type": "package",
+      "path": "bepinex.plugininfoprops/1.1.0",
+      "files": [
+        ".nupkg.metadata",
+        "bepinex.plugininfoprops.1.1.0.nupkg.sha512",
+        "bepinex.plugininfoprops.nuspec",
+        "build/BepInEx.PluginInfoProps.props"
+      ]
+    }
+  },
+  "projectFileDependencyGroups": {
+    "net6.0": [
+      "BepInEx.PluginInfoProps >= 1.*"
+    ]
+  },
+  "packageFolders": {
+    "C:\\Users\\23005\\.nuget\\packages\\": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "d:\\KingdomMod\\BetterKingdom project\\BetterKingdom.csproj",
+      "projectName": "BetterKingdom",
+      "projectPath": "d:\\KingdomMod\\BetterKingdom project\\BetterKingdom.csproj",
+      "packagesPath": "C:\\Users\\23005\\.nuget\\packages\\",
+      "outputPath": "d:\\KingdomMod\\BetterKingdom project\\obj\\",
+      "projectStyle": "PackageReference",
+      "configFilePaths": [
+        "d:\\KingdomMod\\BetterKingdom project\\NuGet.Config",
+        "C:\\Users\\23005\\AppData\\Roaming\\NuGet\\NuGet.Config"
+      ],
+      "originalTargetFrameworks": [
+        "net6.0"
+      ],
+      "sources": {
+        "https://api.nuget.org/v3/index.json": {},
+        "https://nuget.bepinex.dev/v3/index.json": {}
+      },
+      "frameworks": {
+        "net6.0": {
+          "targetAlias": "net6.0",
+          "projectReferences": {}
+        }
+      },
+      "warningProperties": {
+        "warnAsError": [
+          "NU1605"
+        ]
+      }
+    },
+    "frameworks": {
+      "net6.0": {
+        "targetAlias": "net6.0",
+        "dependencies": {
+          "BepInEx.PluginInfoProps": {
+            "suppressParent": "All",
+            "target": "Package",
+            "version": "[1.*, )"
+          }
+        },
+        "imports": [
+          "net461",
+          "net462",
+          "net47",
+          "net471",
+          "net472",
+          "net48",
+          "net481"
+        ],
+        "assetTargetFallback": true,
+        "warn": true,
+        "frameworkReferences": {
+          "Microsoft.NETCore.App": {
+            "privateAssets": "all"
+          }
+        },
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
+      }
+    }
+  }
+}

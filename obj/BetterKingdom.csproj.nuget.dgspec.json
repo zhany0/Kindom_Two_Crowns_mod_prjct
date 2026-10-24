@@ -1,0 +1,70 @@
+{
+  "format": 1,
+  "restore": {
+    "D:\\KingdomMod\\BetterKingdom project\\BetterKingdom.csproj": {}
+  },
+  "projects": {
+    "D:\\KingdomMod\\BetterKingdom project\\BetterKingdom.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "D:\\KingdomMod\\BetterKingdom project\\BetterKingdom.csproj",
+        "projectName": "BetterKingdom",
+        "projectPath": "D:\\KingdomMod\\BetterKingdom project\\BetterKingdom.csproj",
+        "packagesPath": "C:\\Users\\23005\\.nuget\\packages\\",
+        "outputPath": "D:\\KingdomMod\\BetterKingdom project\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "D:\\KingdomMod\\BetterKingdom project\\NuGet.Config",
+          "C:\\Users\\23005\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net6.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {},
+          "https://nuget.bepinex.dev/v3/index.json": {}
+        },
+        "frameworks": {
+          "net6.0": {
+            "targetAlias": "net6.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        }
+      },
+      "frameworks": {
+        "net6.0": {
+          "targetAlias": "net6.0",
+          "dependencies": {
+            "BepInEx.PluginInfoProps": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.*, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

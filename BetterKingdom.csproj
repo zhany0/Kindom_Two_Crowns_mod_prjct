@@ -1,0 +1,297 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- BepInEx IL2CPP（be 版 / Il2CppInterop 1.5.x）插件需面向 net6.0，与游戏 core 中的实际程序集匹配 -->
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>BetterKingdom</AssemblyName>
+    <!-- 插件元信息（BepInEx.PluginInfoProps 据此生成 obj 下的 PluginInfo.cs） -->
+    <BepInExPluginGuid>KingdomMod.BetterKingdom</BepInExPluginGuid>
+    <BepInExPluginName>BetterKingdom</BepInExPluginName>
+    <BepInExPluginVersion>1.0.0</BepInExPluginVersion>
+    <Version>1.0.0</Version>
+    <Description>Kingdom Two Crowns 功能增强模组</Description>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <!-- 引用均来自游戏目录副本，Private=false 不随插件输出，避免依赖污染 -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- 游戏 interop 程序集的间接依赖引用了 .NET6 BCL，与 netstandard2.1 框架版本冲突，仅为编译期噪音，不影响运行 -->
+    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+    <!-- 游戏安装目录（换机器或换安装路径时只改这里） -->
+    <GameDir>D:\Steam\steamapps\common\Kingdom Two Crowns</GameDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 仅保留 PluginInfoProps：编译期生成 PluginInfo.cs，不带来运行时程序集 -->
+    <PackageReference Include="BepInEx.PluginInfoProps" Version="1.*" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- BepInEx / Harmony / Il2CppInterop 核心（来自游戏 BepInEx\core 的副本，net6.0 工具链） -->
+    <Reference Include="BepInEx.Core">
+      <HintPath>libs\BepInEx.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP">
+      <HintPath>libs\BepInEx.Unity.IL2CPP.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BepInEx.Preloader.Core">
+      <HintPath>libs\BepInEx.Preloader.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BepInEx.Unity.Common">
+      <HintPath>libs\BepInEx.Unity.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="HarmonyLib">
+      <HintPath>libs\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppInterop.Runtime">
+      <HintPath>libs\Il2CppInterop.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppInterop.Common">
+      <HintPath>libs\Il2CppInterop.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppInterop.HarmonySupport">
+      <HintPath>libs\Il2CppInterop.HarmonySupport.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- BepInEx 核心的编译期闭包（运行时位于游戏 dotnet\ 与 BepInEx\core 目录） -->
+    <Reference Include="Microsoft.Extensions.Logging.Abstractions">
+      <HintPath>libs\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Logging">
+      <HintPath>libs\Microsoft.Extensions.Logging.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Primitives">
+      <HintPath>libs\Microsoft.Extensions.Primitives.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SemanticVersioning">
+      <HintPath>libs\SemanticVersioning.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="StableNameDotNet">
+      <HintPath>libs\StableNameDotNet.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- BepInEx/Interop 的二级闭包（生成器、反汇编、程序集读写、detour 等，仅编译期需要） -->
+    <Reference Include="Il2CppInterop.Generator">
+      <HintPath>libs\Il2CppInterop.Generator.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="AsmResolver">
+      <HintPath>libs\AsmResolver.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="AsmResolver.DotNet">
+      <HintPath>libs\AsmResolver.DotNet.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="AsmResolver.PE">
+      <HintPath>libs\AsmResolver.PE.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="AsmResolver.PE.File">
+      <HintPath>libs\AsmResolver.PE.File.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="AssetRipper.CIL">
+      <HintPath>libs\AssetRipper.CIL.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="AssetRipper.Primitives">
+      <HintPath>libs\AssetRipper.Primitives.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Cpp2IL.Core">
+      <HintPath>libs\Cpp2IL.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="LibCpp2IL">
+      <HintPath>libs\LibCpp2IL.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Disarm">
+      <HintPath>libs\Disarm.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Gee.External.Capstone">
+      <HintPath>libs\Gee.External.Capstone.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="WasmDisassembler">
+      <HintPath>libs\WasmDisassembler.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Iced">
+      <HintPath>libs\Iced.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Mono.Cecil">
+      <HintPath>libs\Mono.Cecil.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Mono.Cecil.Mdb">
+      <HintPath>libs\Mono.Cecil.Mdb.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Mono.Cecil.Pdb">
+      <HintPath>libs\Mono.Cecil.Pdb.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Mono.Cecil.Rocks">
+      <HintPath>libs\Mono.Cecil.Rocks.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.Backports">
+      <HintPath>libs\MonoMod.Backports.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.ILHelpers">
+      <HintPath>libs\MonoMod.ILHelpers.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.RuntimeDetour">
+      <HintPath>libs\MonoMod.RuntimeDetour.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MonoMod.Utils">
+      <HintPath>libs\MonoMod.Utils.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- IL2CPP 基础类型库（来自游戏 BepInEx\interop 的副本） -->
+    <Reference Include="Il2Cppmscorlib">
+      <HintPath>libs\Il2Cppmscorlib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSystem">
+      <HintPath>libs\Il2CppSystem.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2CppSystem.Core">
+      <HintPath>libs\Il2CppSystem.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- 游戏程序集 -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>libs\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Haglet-Assembly-CSharp-02">
+      <HintPath>libs\Haglet-Assembly-CSharp-02.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Assembly-CSharp-firstpass">
+      <HintPath>libs\Assembly-CSharp-firstpass.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Unity 常用模块（2D / IMGUI / 输入 / UI / 动画 / 音频等） -->
+    <Reference Include="UnityEngine">
+      <HintPath>libs\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>libs\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>libs\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>libs\UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.InputModule">
+      <HintPath>libs\UnityEngine.InputModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>libs\UnityEngine.UIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>libs\UnityEngine.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AnimationModule">
+      <HintPath>libs\UnityEngine.AnimationModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.Physics2DModule">
+      <HintPath>libs\UnityEngine.Physics2DModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>libs\UnityEngine.PhysicsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>libs\UnityEngine.TextRenderingModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AudioModule">
+      <HintPath>libs\UnityEngine.AudioModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.ParticleSystemModule">
+      <HintPath>libs\UnityEngine.ParticleSystemModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.SpriteMaskModule">
+      <HintPath>libs\UnityEngine.SpriteMaskModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TilemapModule">
+      <HintPath>libs\UnityEngine.TilemapModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AssetBundleModule">
+      <HintPath>libs\UnityEngine.AssetBundleModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.ImageConversionModule">
+      <HintPath>libs\UnityEngine.ImageConversionModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.JSONSerializeModule">
+      <HintPath>libs\UnityEngine.JSONSerializeModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- 第三方库：DOTween 补间、Rewired 输入、Newtonsoft.Json -->
+    <Reference Include="DOTween">
+      <HintPath>libs\DOTween.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Rewired_Core">
+      <HintPath>libs\Rewired_Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>libs\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- 编译后自动部署到游戏 BepInEx\plugins 目录；游戏目录不存在时跳过，不影响编译 -->
+  <Target Name="CopyToGamePlugins" AfterTargets="Build" Condition="Exists('$(GameDir)')">
+    <MakeDir Directories="$(GameDir)\BepInEx\plugins\$(AssemblyName)" />
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFolder="$(GameDir)\BepInEx\plugins\$(AssemblyName)"
+          SkipUnchangedFiles="true" />
+    <Message Text="已部署: $(TargetPath) -> $(GameDir)\BepInEx\plugins\$(AssemblyName)" Importance="high" />
+  </Target>
+
+</Project>
