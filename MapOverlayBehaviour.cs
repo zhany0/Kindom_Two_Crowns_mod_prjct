@@ -10,7 +10,6 @@ namespace BetterKingdom
     /// 黄色线表示整张地图，色点标注玩家/城堡/传送门/洞窟/城墙位/箭塔位。
     /// 紫色竖线实时标注怪物波次位置：按 waveID 分组，每批怪物只绘制距离最近的怪物位置。
     /// 左上显示金币（钱袋/国库）与职业统计（含骑士小队弓箭手/高级骑士细分、左右侧火油桶统计），左下显示时间/当前季节天数。
-    /// 另含看门狗：每轮重刷新修正位于墙体内部的弓箭手守卫槽。
     /// </summary>
     public class MapOverlayBehaviour : MonoBehaviour
     {
@@ -114,20 +113,9 @@ namespace BetterKingdom
             }
         }
 
-        //   城墙边界缓存（供弓箭手守墙bug修正使用）  
-        private struct WallBound { public float X; public float HalfW; }
-        private readonly List<WallBound> _wallBounds = new();
-
         //   游戏时间  
         private float _gameTime = -1f;
-        private Player _cachedPlayer;
-        private Player _cachedPlayer2;     // 分屏玩家2缓存（轻刷新重建；单人游戏为 null）
-        private Castle _cachedCastle;      // 城堡缓存（中频重建），钱袋国库联动读写国库用
         private Banker _cachedBanker;      // 银行家（税官）缓存（中频重建），国库真实账本 Banker._stashedCoins 所在
-        //   钱袋国库联动
-        private const int PurseMaxCoins = 38;        // 钱袋容量上限（钻石占 3 金币位，有效金币上限 = 39 - 3×钻石数）
-        private const float PayHoldThreshold = 0.4f; // 长按判定阈值（秒），短点击不触发取款
-        private float _payHoldStartP1 = -1f, _payHoldStartP2 = -1f;   // 各玩家支付键按住计时起点（-1=未计时）
 
         //   季节  
         private Season _season;           // 当前季节
@@ -220,9 +208,6 @@ namespace BetterKingdom
 
             float now = Time.unscaledTime;
 
-            // 钱袋国库联动（每帧：溢出即时存入，长按取款需帧级按键追踪）
-            UpdatePurseTreasuryLink(now);
-
             if (now >= _nextLightRefresh)
             {
                 _nextLightRefresh = now + LightRefreshInterval;
@@ -288,15 +273,6 @@ namespace BetterKingdom
                         _playerX = px;
                         _hasPlayer = true;
                     }
-                    _cachedPlayer = player;
-                    // 分屏玩家2（单人游戏 GetPlayer(1) 返回空或玩家1本身，后者需剔除）
-                    try
-                    {
-                        _cachedPlayer2 = kingdom.GetPlayer(1);
-                        if (_cachedPlayer2 != null && player != null && _cachedPlayer2.playerId == player.playerId)
-                            _cachedPlayer2 = null;
-                    }
-                    catch { _cachedPlayer2 = null; }
                 }
                 catch { }
 
@@ -307,86 +283,6 @@ namespace BetterKingdom
                 RefreshCropBars();
             }
             catch { }
-        }
-
-        /// <summary>
-        /// 钱袋国库联动（每帧调用）：钱袋有效金币上限 = 38 - 2×钻石数（钻石占用钱袋容量），超出部分自动存入国库
-        /// （金币逐枚进袋，每帧检查不会漏）；钱袋为空且长按支付键（而非点击）达到阈值时，从国库取出填满有效上限
-        /// （国库不足则全部取出）。
-        /// </summary>
-        private void UpdatePurseTreasuryLink(float now)
-        {
-            if (!ModWindowBehaviour.LinkPurseTreasury) return;
-            Castle castle = _cachedCastle;
-            if (castle == null) return;   // 尚无城堡（国库）时不做任何转移
-            Banker banker = _cachedBanker;
-            HandlePurseLink(_cachedPlayer, 0, castle, banker, now, ref _payHoldStartP1);
-            HandlePurseLink(_cachedPlayer2, 1, castle, banker, now, ref _payHoldStartP2);
-        }
-
-        /// <summary>读国库账本：优先税官账本（Banker._stashedCoins），无税官时回退城堡显示字段。</summary>
-        private static int ReadTreasury(Banker banker, Castle castle)
-        {
-            if (banker != null) { try { return banker._stashedCoins; } catch { } }
-            try { return castle._currentCoinCount; } catch { return 0; }
-        }
-
-        /// <summary>写国库账本：税官账本与城堡显示镜像同步写，避免税官下次存钱时用旧账本覆盖显示造成"回弹"。</summary>
-        private static void WriteTreasury(Banker banker, Castle castle, int value)
-        {
-            if (banker != null) { try { banker._stashedCoins = value; } catch { } }
-            try { castle._currentCoinCount = value; } catch { }
-            try { castle.SendStashCount(); } catch { }
-        }
-
-        /// <summary>单个玩家的钱袋联动：先处理溢出存入，再处理空袋长按取款。</summary>
-        private void HandlePurseLink(Player p, int playerIndex, Castle castle, Banker banker, float now, ref float holdStart)
-        {
-            if (p == null) { holdStart = -1f; return; }
-            int coins, gems;
-            Wallet wallet;
-            try { coins = p.coins; gems = p.gems; wallet = p.wallet; } catch { holdStart = -1f; return; }
-            // 钻石占用钱袋容量（1 颗钻石 = 2 金币位），有效金币上限 = 38 - 2×钻石数，下限 0
-            int maxCoins = Math.Max(0, PurseMaxCoins - 3 * gems);
-
-            // 溢出存入：钱袋金币超过有效上限时把多余部分装入国库
-            if (coins > maxCoins)
-            {
-                int excess = coins - maxCoins;
-                try
-                {
-                    int stash = ReadTreasury(banker, castle);
-                    wallet.RemoveCurrency(CurrencyType.Coins, excess);
-                    WriteTreasury(banker, castle, stash + excess);
-                    coins = maxCoins;
-                }
-                catch { }
-            }
-
-            // 空袋取款：菜单/MOD 窗口打开时游戏输入被屏蔽，不判定按键；
-            // 松开按键或袋中有钱时重置计时，保证每次取款前都有一段完整的长按
-            bool held = !_isMenuOpen && !ModWindowBehaviour.IsOpen && SafePayHeld(playerIndex);
-            if (!held || coins > 0) { holdStart = -1f; return; }
-            if (holdStart < 0f) { holdStart = now; return; }        // 开始长按计时
-            if (now - holdStart < PayHoldThreshold) return;         // 未达阈值（短点击不触发）
-            holdStart = -1f;                                        // 本次长按只触发一次
-            try
-            {
-                int stash = ReadTreasury(banker, castle);
-                if (stash <= 0) return;
-                // 取出量 = 填满有效上限所需金币数（受钻石占容量影响），国库不足则全取
-                int take = Math.Min(maxCoins, stash);
-                if (take <= 0) return;
-                WriteTreasury(banker, castle, stash - take);
-                wallet.AddCurrency(CurrencyType.Coins, take);
-            }
-            catch { }
-        }
-
-        /// <summary>安全读取指定玩家的支付键按住状态（互操作/配置异常时视为未按）。</summary>
-        private static bool SafePayHeld(int playerIndex)
-        {
-            try { return ModWindowBehaviour.IsPayKeyHeld(playerIndex); } catch { return false; }
         }
 
         /// <summary>
@@ -419,18 +315,13 @@ namespace BetterKingdom
                     if (director != null)
                     {
                         _gameTime = director.currentTime;
-                        try
-                        {
-                            TimesOfDay tod = director.CurrentTimesOfDay;
-                        }
-                        catch { }
 
                         // 季节与季节内天数（每季 16 天，由统治累计天数推算，换岛不重置）
                         try
                         {
-                            int day = SeasonClock.GetDayNumber(director);
-                            _season = SeasonClock.GetSeason(director, day);
-                            _seasonDay = SeasonClock.GetSeasonDay(director, day);
+                            int day = GetDayNumber(director);
+                            _season = GetSeason(director, day);
+                            _seasonDay = GetSeasonDay(director, day);
                             _hasSeason = true;
                         }
                         catch { _hasSeason = false; }
@@ -452,7 +343,6 @@ namespace BetterKingdom
                     // 路径1：Castle._currentCoinCount（城堡 UI 显示的金币堆数量）
                     int castleCoins = 0;
                     Castle castle = kingdom.castle;
-                    _cachedCastle = castle;
                     if (castle != null)
                     {
                         try { castleCoins = castle._currentCoinCount; } catch { }
@@ -789,7 +679,6 @@ namespace BetterKingdom
                 catch { }
 
                 CollectWallAndTowerMarkers(kingdom, boundsValid, ref minX, ref maxX);
-                CollectWallBounds(kingdom);
 
                 // 功能开关控制的额外标记：仅开关开启时收集（关闭时清空不绘制）
                 _campMarkers.Clear();
@@ -809,156 +698,6 @@ namespace BetterKingdom
                 float pad = (boundsValid ? 0.005f : 0.02f) * (maxX - minX);
                 _minX = minX - pad;
                 _maxX = maxX + pad;
-
-                // 看门狗：修正位于墙体内部的弓箭手守卫槽与弓箭手本体（游戏原生bug）
-                FixWallDefensePositions(kingdom);
-            }
-            catch { }
-        }
-
-        /// <summary>收集真实墙体的水平边界（中心X与半宽），供弓箭手守墙bug修正使用。</summary>
-        private void CollectWallBounds(Kingdom kingdom)
-        {
-            _wallBounds.Clear();
-            try
-            {
-                Il2CppSystem.Collections.Generic.ICollection<Wall> walls = kingdom.Walls;
-                if (walls == null) return;
-                int count = walls.Count;
-                if (count <= 0) return;
-                var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall>(count);
-                walls.CopyTo(arr, 0);
-                for (int i = 0; i < count; i++)
-                {
-                    Wall wall = arr[i];
-                    if (!TryGetX(wall, out float x)) continue;
-                    // 墙体半宽：优先取碰撞体世界边界，失败用经验值 1
-                    float halfW = 1f;
-                    try
-                    {
-                        Collider2D col = wall.GetComponentInChildren<Collider2D>();
-                        if (col != null) halfW = Math.Max(0.3f, col.bounds.extents.x);
-                    }
-                    catch { }
-                    _wallBounds.Add(new WallBound { X = x, HalfW = halfW });
-                }
-            }
-            catch { }
-        }
-
-        /// <summary>
-        /// 游戏原生bug修正入口：弓箭手守墙待机位有时会位于墙体内部。每轮重刷新检测并修正。
-        /// </summary>
-        private void FixWallDefensePositions(Kingdom kingdom)
-        {
-            try
-            {
-                if (_wallBounds.Count == 0) return;
-                // 需要城堡位置判断“墙后”是哪一侧
-                if (!TryGetX(kingdom.castle, out float castleX)) return;
-
-                FixGuardSlotsInsideWalls(kingdom, castleX);
-                FixArchersInsideWalls(kingdom, castleX);
-            }
-            catch { }
-        }
-
-        /// <summary>若 worldX 位于某墙体内部，计算修正位置（墙后城堡一侧，与墙保持 1 格间距）。</summary>
-        private bool TryFixInsideWall(float worldX, float castleX, out float newX, out float wallX)
-        {
-            for (int i = 0; i < _wallBounds.Count; i++)
-            {
-                WallBound wb = _wallBounds[i];
-                if (Math.Abs(worldX - wb.X) < wb.HalfW + 0.2f)
-                {
-                    wallX = wb.X;
-                    float dir = castleX >= wb.X ? 1f : -1f;
-                    newX = wb.X + dir * (wb.HalfW + 1f);
-                    return true;
-                }
-            }
-            newX = 0f;
-            wallX = 0f;
-            return false;
-        }
-
-        /// <summary>修正位于墙体内部的守卫槽（GuardSlot），弓箭手会自行走到修正后的位置。</summary>
-        private void FixGuardSlotsInsideWalls(Kingdom kingdom, float castleX)
-        {
-            try
-            {
-                Il2CppSystem.Collections.Generic.HashSet<GuardSlot> slots = kingdom._guardSlots;
-                if (slots == null || slots.Count <= 0) return;
-                int slotCount = slots.Count;
-                var slotArr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<GuardSlot>(slotCount);
-                slots.CopyTo(slotArr, 0);
-                for (int i = 0; i < slotCount; i++)
-                {
-                    GuardSlot slot = slotArr[i];
-                    if (slot == null) continue;
-                    Vector3 pos;
-                    try { pos = slot.transform.position; } catch { continue; }
-
-                    if (TryFixInsideWall(pos.x, castleX, out float newX, out float wallX))
-                    {
-                        try
-                        {
-                            slot.transform.position = new Vector3(newX, pos.y, pos.z);
-                        }
-                        catch { }
-                    }
-                }
-            }
-            catch { }
-        }
-
-        /// <summary>
-        /// 修正位于墙体内部的弓箭手本体：仅处理守墙状态（ShouldGoToWall 或已在守卫槽）的弓箭手。
-        /// 根因 ：游戏原生bug导致 _guardDepth 守卫深度漂移为负值且不再恢复，
-        /// 目标站位 = 墙x ± (最小间距 + 深度×单位间距 + 随机偏移)，负深度会吃掉与墙间距，使弓箭手站进墙体内部。
-        /// 治本方案：负深度钳制回 0，再把墙内弓箭手移出。
-        /// </summary>
-        private void FixArchersInsideWalls(Kingdom kingdom, float castleX)
-        {
-            try
-            {
-                Il2CppSystem.Collections.Generic.ICollection<Archer> archers = kingdom.Archers;
-                if (archers == null) return;
-                int count = archers.Count;
-                if (count <= 0) return;
-                var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(count);
-                archers.CopyTo(arr, 0);
-                for (int i = 0; i < count; i++)
-                {
-                    Archer a = arr[i];
-                    if (a == null) continue;
-
-                    // 只处理守墙状态的弓箭手
-                    bool defending = false;
-                    try { defending = a.ShouldGoToWall() || a.inGuardSlot; } catch { }
-                    if (!defending) continue;
-
-                    Vector3 pos;
-                    try { pos = a.transform.position; } catch { continue; }
-
-                    // 治本：守卫深度为负时钳制回 0，目标站位即恢复到墙后正常距离
-                    try
-                    {
-                        int depth = a._guardDepth;
-                        if (depth < 0) a._guardDepth = 0;
-                    }
-                    catch { }
-
-                    // 治标：已站在墙体内的弓箭手立即移出到墙后
-                    if (TryFixInsideWall(pos.x, castleX, out float newX, out float wallX))
-                    {
-                        try
-                        {
-                            a.transform.position = new Vector3(newX, pos.y, pos.z);
-                        }
-                        catch { }
-                    }
-                }
             }
             catch { }
         }
@@ -1781,6 +1520,81 @@ namespace BetterKingdom
                 GUI.Label(new Rect(labelX, labelY, labelW, LabelFontSize + 4f), label, _styleLabel);
                 GUI.color = prev;
             }
+        }
+
+        // ==================== 季节时钟（覆盖层左下角时间/季节显示） ====================
+
+        private const int DaysPerSeason = 16;   // 每季 16 天
+
+        /// <summary>统治累计天数（换岛不重置，从 1 开始）；取不到时回退到导演当前天数，均失败返回 0。</summary>
+        private static int GetDayNumber(Director director)
+        {
+            try
+            {
+                CampaignSaveData save = CampaignSaveData.current;
+                if (save != null)
+                {
+                    int day = save.TotalGameDays + 1;
+                    if (day > 0) return day;
+                }
+            }
+            catch { }
+
+            try
+            {
+                if (director != null)
+                {
+                    int day = director.CurrentDaysSinceFirstLandingThisReign;
+                    if (day > 0) return day;
+                }
+            }
+            catch { }
+
+            return 0;
+        }
+
+        /// <summary>按累计天数推算季节（季节枚举值 1/2/4/8 分别对应夏/秋/冬/春）；以秋天开局时整体后移两个季度。</summary>
+        private static Season GetSeason(Director director, int day)
+        {
+            if (day > 0)
+            {
+                int index = (day - 1) / DaysPerSeason;
+                try
+                {
+                    if (director != null && director.startGameInAutumn) index += 2;
+                }
+                catch { }
+
+                switch (index % 4)
+                {
+                    case 0: return (Season)8;   // 春
+                    case 1: return (Season)1;   // 夏
+                    case 2: return (Season)2;   // 秋
+                    default: return (Season)4;  // 冬
+                }
+            }
+
+            try
+            {
+                if (director != null) return director.CurrentSeason;
+            }
+            catch { }
+
+            return (Season)8;
+        }
+
+        /// <summary>季节内第几天（1-16）；取不到累计天数时回退到导演当前季节天数。</summary>
+        private static int GetSeasonDay(Director director, int day)
+        {
+            if (day > 0) return (day - 1) % DaysPerSeason + 1;
+
+            try
+            {
+                if (director != null) return director.CurrentSeasonDay;
+            }
+            catch { }
+
+            return 0;
         }
     }
 }

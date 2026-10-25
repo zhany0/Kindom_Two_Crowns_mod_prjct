@@ -14,6 +14,7 @@ namespace BetterKingdom
             // 将自定义 MonoBehaviour 注册进 IL2CPP 域，之后才能 AddComponent
             ClassInjector.RegisterTypeInIl2Cpp<MapOverlayBehaviour>();
             ClassInjector.RegisterTypeInIl2Cpp<ModWindowBehaviour>();
+            ClassInjector.RegisterTypeInIl2Cpp<FeatureBehaviour>();
 
             // 绑定并读取功能开关的持久化配置（退出游戏后保留设置）
             ModWindowBehaviour.InitConfig(Config);
@@ -23,6 +24,7 @@ namespace BetterKingdom
             go.hideFlags = HideFlags.HideAndDontSave;
             go.AddComponent<MapOverlayBehaviour>();
             go.AddComponent<ModWindowBehaviour>();
+            go.AddComponent<FeatureBehaviour>();
 
             // 应用 IMGUI 中文字体补丁（移植自 KingdomMod.DevTools，移植后可安全删除该插件）
             var harmony = new Harmony(PluginInfo.PLUGIN_GUID);
@@ -34,36 +36,10 @@ namespace BetterKingdom
             harmony.PatchAll(typeof(PlayerReceiveInputPatch));
             // 游玩态补写光标显示（游戏 CursorSystem 会隐藏系统光标，MOD 需要其常显）
             harmony.PatchAll(typeof(CursorSystemUpdatePatch));
-            // 摇铃后 NPC 立即上船（拦截上船目标指派，直接传送登船）
+            // 功能实现相关补丁：摇铃立即上船、传送门摧毁后的工人分配
             harmony.PatchAll(typeof(EmbarkeeInstantBoardPatch));
-        }
-    }
-
-    /// <summary>
-    /// 摇铃后 NPC 立即上船：游戏给单位指派上船目标（SetEmbarkableTarget）是摇铃召唤的唯一途径，
-    /// 此处若目标是船且单位为工人/弓箭手/骑士（摇铃只召唤这三类），直接 Embark 传送登船，省去跑动。
-    /// 玩家无这三类组件，天然不受影响；随从弓箭手由骑士上船时指派，同样被本补丁传送；
-    /// 读档恢复乘船单位时也走同一指派路径，重复 Embark 无副作用。开关关闭时补丁直接放行。
-    /// </summary>
-    [HarmonyPatch(typeof(Embarkee), nameof(Embarkee.SetEmbarkableTarget))]
-    public static class EmbarkeeInstantBoardPatch
-    {
-        public static void Postfix(Embarkee __instance, Embarkable embarkable)
-        {
-            if (!ModWindowBehaviour.BellInstantBoard) return;
-            if (__instance == null || embarkable == null) return;
-            try
-            {
-                // 仅响应以"船"为目标的指派（排除舰队小艇等其他 Embarkable）
-                if (embarkable._owner == null || embarkable._owner.TryCast<Boat>() == null) return;
-                // 玩家与其他单位无这三类组件，不会被误传送
-                if (__instance.GetComponent<Worker>() == null
-                    && __instance.GetComponent<Archer>() == null
-                    && __instance.GetComponent<Knight>() == null) return;
-                if (__instance.IsEmbarked) return;
-                __instance.Embark();
-            }
-            catch { }
+            harmony.PatchAll(typeof(PortalWorkerDistributionPatch));
+            harmony.PatchAll(typeof(PortalDestroyedPatch));
         }
     }
 
