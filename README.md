@@ -1,3 +1,5 @@
+**非二次开发人员勿下，普通玩家请下载<https://github.com/zhany0/Kindom_Two_Crowns_mod>中的现成mod**
+
 # BetterKingdom
 
 《王国：两位君主》（Kingdom Two Crowns）的功能增强模组，基于 BepInEx 6（IL2CPP）与 Harmony 开发。
