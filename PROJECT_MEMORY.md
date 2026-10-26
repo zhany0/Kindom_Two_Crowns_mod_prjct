@@ -94,6 +94,14 @@
    - “季节日改为早上更新”仍只在显示层做偏移：`currentTime < dayStart≈5` 时把日序号减 1，再重新取季节（保证季节名与天数一致）。
 4. **传送门**：`PayableTeleporter.linkedTo` 是普通/双向的唯一可靠判据；`World.teleporters` 才是枚举入口，不要全场景 `FindObjectsByType`。
 5. **传送门摧毁后工人改派**：每侧保留 2 名工人，其余改派洞窟侧；必须用无状态周期性检测，不能依赖摧毁事件（旧存档中传送门可能已提前摧毁）。
+6. **守墙排队机制**：`Kingdom.DistributeFreeArchers` 按顺序给同侧守墙弓箭手分配递增的 `Archer._guardDepth`（排队序号）；
+   `Archer.GetWallTargetPos` 站位 = 墙位 ∓（最小间距 `_minDistanceFromWall`1.75 + 深度×`_unitSpacingAtWall`0.11 + `_guardRandomOffset`0.25），
+   `Side.Left=-1 / Side.Right=1`（正负号即方向）。深度越大离墙越远，超出 `shootRange`（默认 6.5）后无法攻击墙外怪物。
+   功能开关“禁用排队机制”的做法：周期性把已分配守墙侧（`_guardSide` 为 ±1）弓箭手的 `_guardDepth` 归零，统一站到墙后最近射程内；
+   钳制时按 `GetInstanceID()` 记录原始深度，关闭开关后立刻写回还原（`RestoreWallQueueing`），弓箭手/骑士会自动走回排队站位。
+   骑士是另一套机制：`Kingdom.RankKnights` 给同侧骑士依次写 `Knight.rank = 1..N`，`Knight.GetTargetPos` 站位 = 墙位 ∓ `rank`×`_distanceFromWall`（rank 从 1 起算，无单独最小间距），同一开关下把 `rank > 1` 的骑士归 1；骑士跟随士兵随骑士整体前移，无需单独处理。
+   `Knight.ShouldGoToWall` 会比较当前位置与 `GetTargetPos()`，因此写回 `rank` 后骑士会自行重新走位，无需调用 `RankKnights()`。
+   `Pikeman` 有独立的三格墙位（`Pikeman.Assign(Wall, readiness)`，站位含 `3-readiness`），不是长队；`Berserker` 只有固定 `distanceFromWall`，无排队序号。
 
 ## 5. 未知字段/方法怎么查（逆向工具链）
 

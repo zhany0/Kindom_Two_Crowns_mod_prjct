@@ -36,10 +36,13 @@ namespace BetterKingdom
             harmony.PatchAll(typeof(PlayerReceiveInputPatch));
             // 游玩态补写光标显示（游戏 CursorSystem 会隐藏系统光标，MOD 需要其常显）
             harmony.PatchAll(typeof(CursorSystemUpdatePatch));
-            // 功能实现相关补丁：摇铃立即上船、传送门摧毁后的工人分配
+            // 功能实现相关补丁：摇铃立即上船、传送门摧毁后的工人分配、禁用守墙排队
             harmony.PatchAll(typeof(EmbarkeeInstantBoardPatch));
             harmony.PatchAll(typeof(PortalWorkerDistributionPatch));
             harmony.PatchAll(typeof(PortalDestroyedPatch));
+            harmony.PatchAll(typeof(WallQueueArcherDistributionPatch));
+            harmony.PatchAll(typeof(WallQueueFreeArcherDistributionPatch));
+            harmony.PatchAll(typeof(WallQueueKnightRankPatch));
         }
     }
 

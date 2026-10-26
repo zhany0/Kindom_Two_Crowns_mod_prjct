@@ -17,6 +17,7 @@ namespace BetterKingdom
 
         private const float CacheInterval = 0.25f;   // 玩家/城堡/国库缓存刷新间隔
         private const float HeavyInterval = 2f;      // 墙体修正与传送门工人检查间隔
+        private const float WallQueueClampInterval = 0.25f;  // 禁用排队时复钳间隔（游戏可能在分配补丁之外重写排队值）
         private const int PurseMaxCoins = 38;        // 钱袋容量上限（钻石占 3 金币位，有效金币上限 = 38 - 3×钻石数）
         private const float PayHoldThreshold = 0.4f; // 长按判定阈值（秒），短点击不触发取款
         private const int PortalSideWorkerLimit = 2; // 传送门被摧毁后该侧保留的工人数
@@ -27,12 +28,17 @@ namespace BetterKingdom
         private Banker _cachedBanker;
         private bool _isMenuOpen;
         private float _payHoldStartP1 = -1f, _payHoldStartP2 = -1f;
-        private float _nextCacheRefresh, _nextHeavyWork, _nextPortalCheck;
+        private float _nextCacheRefresh, _nextHeavyWork, _nextPortalCheck, _nextWallQueueClamp;
         private static float _nextCaveScan;  // 兜底场景搜索洞窟的节流时间
 
         // 城墙边界缓存（供弓箭手守墙bug修正使用）
         private struct WallBound { public float X; public float HalfW; }
         private readonly List<WallBound> _wallBounds = new();
+
+        // 禁用排队机制：记录钳制前的原始排队值（键为对象实例ID），关闭开关时按原值立即还原
+        private static readonly Dictionary<int, int> _savedGuardDepth = new();
+        private static readonly Dictionary<int, int> _savedKnightRank = new();
+        private bool _lastDisableWallQueue;
 
         /// <summary>当前实例（供 Harmony 补丁在传送门摧毁时立即触发检查）。</summary>
         public static FeatureBehaviour Instance { get; private set; }
@@ -40,6 +46,7 @@ namespace BetterKingdom
         private void Awake()
         {
             Instance = this;
+            _lastDisableWallQueue = ModWindowBehaviour.DisableWallQueue;
         }
 
         private void OnDestroy()
@@ -51,12 +58,21 @@ namespace BetterKingdom
         {
             if (!IsOverlayVisible()) return;
             _isMenuOpen = IsMenuOpen();
+            SyncWallQueueSwitch();
 
             float now = Time.unscaledTime;
             if (now >= _nextCacheRefresh)
             {
                 _nextCacheRefresh = now + CacheInterval;
                 RefreshCaches();
+            }
+
+            // 禁用排队时高频复钳：游戏会在夜袭等时机经其它分配路径重新写入排队深度，
+            // 只靠分配补丁与 2 秒重活会让弓箭手先短暂走回队列站位
+            if (ModWindowBehaviour.DisableWallQueue && now >= _nextWallQueueClamp)
+            {
+                _nextWallQueueClamp = now + WallQueueClampInterval;
+                ClampWallQueueing();
             }
 
             // 钱袋国库联动（每帧：溢出即时存入，长按取款需帧级按键追踪）
@@ -239,6 +255,9 @@ namespace BetterKingdom
                 Kingdom kingdom = managers != null ? managers.kingdom : null;
                 if (kingdom == null) return;
 
+                // 禁用守墙排队（不依赖墙体缓存，先执行）
+                DisableWallQueueing(kingdom);
+
                 CollectWallBounds(kingdom);
                 if (_wallBounds.Count == 0) return;
                 // 需要城堡位置判断"墙后"是哪一侧
@@ -248,6 +267,173 @@ namespace BetterKingdom
                 FixArchersInsideWalls(kingdom, castleX);
             }
             catch { }
+        }
+
+        // ==================== 守墙排队禁用 ====================
+
+        /// <summary>开关翻转检测：开启时立即钳制排队站位，关闭时立即还原游戏原生排队。</summary>
+        private void SyncWallQueueSwitch()
+        {
+            bool disable = ModWindowBehaviour.DisableWallQueue;
+            if (disable == _lastDisableWallQueue) return;
+            _lastDisableWallQueue = disable;
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return;
+                if (disable) DisableWallQueueing(kingdom);
+                else RestoreWallQueueing(kingdom);
+            }
+            catch { }
+        }
+
+        /// <summary>取当前王国并复钳排队值（棋盘尚未创建时跳过）。</summary>
+        private static void ClampWallQueueing()
+        {
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom != null) DisableWallQueueing(kingdom);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 禁用游戏自带的守墙排队机制：
+        /// 1) 弓箭手：Kingdom.DistributeFreeArchers 按顺序给同侧弓箭手分配递增的 _guardDepth，
+        ///    Archer.GetWallTargetPos 按"墙位 ∓（最小间距 + 深度×单位间距 + 随机偏移）"计算站位，
+        ///    深度越大离墙越远；深度归零后统一站到墙后最近的可用距离（射程内）。
+        /// 2) 骑士小队：Kingdom.RankKnights 给同侧骑士依次写入 rank = 1..N，
+        ///    Knight.GetTargetPos 按"墙位 ∓ rank×_distanceFromWall"计算站位，
+        ///    rank 归 1 后所有骑士（及其跟随的士兵）都站在墙后最近的一排。
+        /// </summary>
+        internal static void DisableWallQueueing(Kingdom kingdom)
+        {
+            if (!ModWindowBehaviour.DisableWallQueue) return;
+            try
+            {
+                Il2CppSystem.Collections.Generic.ICollection<Archer> archers = kingdom.Archers;
+                if (archers != null)
+                {
+                    int count = archers.Count;
+                    if (count > 0)
+                    {
+                        var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(count);
+                        archers.CopyTo(arr, 0);
+                        for (int i = 0; i < count; i++)
+                        {
+                            Archer a = arr[i];
+                            if (a == null) continue;
+                            try
+                            {
+                                // 只处理已分配守墙侧的弓箭手（未分配时 Side 为 0）
+                                Side guardSide = a._guardSide;
+                                if (guardSide != Side.Left && guardSide != Side.Right) continue;
+                                int depth = a._guardDepth;
+                                if (depth != 0)
+                                {
+                                    // 记录钳制前的真实排队深度（重新分配时覆盖为最新值），关闭开关后按此还原
+                                    _savedGuardDepth[a.GetInstanceID()] = depth;
+                                    a._guardDepth = 0;
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                Il2CppSystem.Collections.Generic.ICollection<Knight> knights = kingdom.Knights;
+                if (knights == null) return;
+                int count = knights.Count;
+                if (count <= 0) return;
+                var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight>(count);
+                knights.CopyTo(arr, 0);
+                for (int i = 0; i < count; i++)
+                {
+                    Knight k = arr[i];
+                    if (k == null) continue;
+                    try
+                    {
+                        // rank 从 1 起算，1 = 墙后最近的一排；归 1 即取消骑士序列
+                        int rank = k.rank;
+                        if (rank > 1)
+                        {
+                            _savedKnightRank[k.GetInstanceID()] = rank;
+                            k.rank = 1;
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 关闭“禁用排队机制”后立即恢复游戏原生排队：
+        /// 把钳制前记录的原始 _guardDepth / rank 写回，弓箭手与骑士的目标位置由这两个值推导，
+        /// 写回后它们会自行走回排队站位（无需重新触发游戏的分配流程）。
+        /// </summary>
+        internal static void RestoreWallQueueing(Kingdom kingdom)
+        {
+            try
+            {
+                Il2CppSystem.Collections.Generic.ICollection<Archer> archers = kingdom.Archers;
+                if (archers != null)
+                {
+                    int count = archers.Count;
+                    if (count > 0)
+                    {
+                        var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(count);
+                        archers.CopyTo(arr, 0);
+                        for (int i = 0; i < count; i++)
+                        {
+                            Archer a = arr[i];
+                            if (a == null) continue;
+                            try
+                            {
+                                if (_savedGuardDepth.TryGetValue(a.GetInstanceID(), out int depth) && depth > 0)
+                                    a._guardDepth = depth;
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+            catch { }
+            _savedGuardDepth.Clear();
+
+            try
+            {
+                Il2CppSystem.Collections.Generic.ICollection<Knight> knights = kingdom.Knights;
+                if (knights != null)
+                {
+                    int count = knights.Count;
+                    if (count > 0)
+                    {
+                        var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight>(count);
+                        knights.CopyTo(arr, 0);
+                        for (int i = 0; i < count; i++)
+                        {
+                            Knight k = arr[i];
+                            if (k == null) continue;
+                            try
+                            {
+                                if (_savedKnightRank.TryGetValue(k.GetInstanceID(), out int rank) && rank > 1)
+                                    k.rank = rank;
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+            catch { }
+            _savedKnightRank.Clear();
         }
 
         /// <summary>收集真实墙体的水平边界（中心X与半宽），供弓箭手守墙bug修正使用。</summary>
@@ -631,6 +817,39 @@ namespace BetterKingdom
             }
             catch { return; }
             FeatureBehaviour.RequestPortalWorkerCheck();
+        }
+    }
+
+    /// <summary>游戏重新分配守墙弓箭手后立即取消排队，避免出现短暂的远距离站位。</summary>
+    [HarmonyPatch(typeof(Kingdom), nameof(Kingdom.DistributeArchers))]
+    public static class WallQueueArcherDistributionPatch
+    {
+        public static void Postfix(Kingdom __instance)
+        {
+            FeatureBehaviour.DisableWallQueueing(__instance);
+        }
+    }
+
+    /// <summary>游戏重排骑士 rank 后立即取消骑士排队，保证骑士小队也站在墙后最近的一排。</summary>
+    [HarmonyPatch(typeof(Kingdom), nameof(Kingdom.RankKnights))]
+    public static class WallQueueKnightRankPatch
+    {
+        public static void Postfix(Kingdom __instance)
+        {
+            FeatureBehaviour.DisableWallQueueing(__instance);
+        }
+    }
+
+    /// <summary>
+    /// 游戏重新分配空闲弓箭手（守墙排队的主要路径，夜袭开始时触发）后立即取消排队。
+    /// DistributeArchers 只处理部分情形，实际分配守墙深度的是 DistributeFreeArchers。
+    /// </summary>
+    [HarmonyPatch(typeof(Kingdom), nameof(Kingdom.DistributeFreeArchers))]
+    public static class WallQueueFreeArcherDistributionPatch
+    {
+        public static void Postfix(Kingdom __instance)
+        {
+            FeatureBehaviour.DisableWallQueueing(__instance);
         }
     }
 }

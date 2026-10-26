@@ -25,7 +25,6 @@ namespace BetterKingdom
         private const float MediumRefreshInterval = 0.25f;
         private const float HeavyRefreshInterval = 2f;
         private const float DotRadius = 7f;
-        private const float EnemyLineSmoothSpeed = 50f;    // 怪物竖线平滑速度（世界单位/秒），消除阶跃瞬移
         private const int EnemySideHysteresis = 2;         // 侧别切换滞回（多数侧需多出该数量才切换）
         private const int LabelFontSize = 18;
         private const int InfoFontSize = 20;
@@ -116,9 +115,8 @@ namespace BetterKingdom
             public float Min, Max;
             public int LeftCount, RightCount;   // 本帧以城堡为界的左右两侧数量（判定本波属于哪一侧）
             public int Side;                    // 0=未判定 1=左侧 2=右侧（带滞回，避免分界处来回切换）
-            public float Shown;                 // 已平滑的显示坐标（世界X）
             public bool Seen;                   // 本帧是否已统计（Min/Max 必须每帧重算，不能沿用历史极值）
-            public void Reset(float x) { Min = x; Max = x; LeftCount = 0; RightCount = 0; Side = 0; Shown = x; Seen = true; }
+            public void Reset(float x) { Min = x; Max = x; LeftCount = 0; RightCount = 0; Side = 0; Seen = true; }
             public void Begin(float x) { Min = x; Max = x; LeftCount = 0; RightCount = 0; Seen = true; }
             public void Add(float x)
             {
@@ -538,7 +536,7 @@ namespace BetterKingdom
                     _enemyBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy>(Math.Max(count, 16));
                 all.CopyTo(_enemyBuffer, 0);
 
-                // 按 waveID 分组：字典跨帧保留同一波次，平滑位置与侧别才能延续；
+                // 按 waveID 分组：字典跨帧保留同一波次，侧别判定才能延续；
                 // 每帧先把所有分组的“已统计”标记清零，Min/Max 必须按本帧怪物重算
                 foreach (KeyValuePair<uint, WaveGroup> kv in _waveGroups) kv.Value.Seen = false;
 
@@ -617,7 +615,6 @@ namespace BetterKingdom
                 }
                 for (int i = 0; i < _staleWaveIds.Count; i++) _waveGroups.Remove(_staleWaveIds[i]);
 
-                float moveStep = Time.unscaledDeltaTime * EnemyLineSmoothSpeed;
                 foreach (KeyValuePair<uint, WaveGroup> kv in _waveGroups)
                 {
                     WaveGroup g = kv.Value;
@@ -631,10 +628,8 @@ namespace BetterKingdom
                         g.Side = 2;
 
                     // 右侧出怪显示最左侧怪的位置，左侧出怪显示最右侧怪的位置；
-                    // 最近怪物死亡或被新兵替换时目标会阶跃，这里按固定速度平滑移动，避免竖线瞬移
-                    float target = g.Side == 2 ? g.Min : g.Max;
-                    g.Shown = Mathf.MoveTowards(g.Shown, target, moveStep);
-                    _enemyLineX.Add(g.Shown);
+                    // 目标点（最近怪物）变化时竖线立即跟随，不做平滑插值
+                    _enemyLineX.Add(g.Side == 2 ? g.Min : g.Max);
                 }
             }
             catch { }

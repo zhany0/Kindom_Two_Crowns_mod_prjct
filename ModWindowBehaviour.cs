@@ -51,8 +51,9 @@ namespace BetterKingdom
         private const float TabBarBgPad = 14f;             // 分隔底条上下各超出页签的高度（形成"次级标题栏"横带）
         private const float TabSpacing = 16f;
         private const int TabFontSize = 22;
-        private static readonly Color TabNormalColor = new(0.12f, 0.10f, 0.09f, 1f);   // 未选中页签（暗）
-        private static readonly Color TabActiveColor = new(0.30f, 0.24f, 0.19f, 1f);   // 选中页签/悬停（亮）
+        private static readonly Color TabNormalColor = new(0.32f, 0.26f, 0.21f, 1f);   // 未选中页签（亮，视觉凸起）
+        private static readonly Color TabHoverColor = new(0.40f, 0.33f, 0.27f, 1f);    // 未选中页签悬停（更亮）
+        private static readonly Color TabActiveColor = new(0.12f, 0.10f, 0.09f, 1f);   // 选中页签（暗，视觉下沉）
 
         // ---- 功能开关（方形槽样式，含下方解释文字行） ----
         private const float ToggleRowHeight = 84f;         // 行高（下部为解释文字行区，其余为主标签区，留空不紧凑）
@@ -151,9 +152,10 @@ namespace BetterKingdom
         public static bool ShowCoins;         // 金币数量显示
         public static bool ShowTimeSeason;    // 时间与当前季节天数显示
         public static bool BellInstantBoard;  // 摇铃后被召唤的职业立即传送上船（省去跑动，不影响玩家）
+        public static bool DisableWallQueue;  // 禁用排队机制（开启后守墙弓箭手与骑士不再沿墙后排长队，统一站在墙后可射击的距离内）
 
         // ---- 持久化配置项（Plugin.Load 时绑定并读取；ConfigEntry 赋值即自动写盘） ----
-        private static ConfigEntry<bool> _cfgAllDefenses, _cfgOnlyBuilt, _cfgCamps, _cfgStatues, _cfgMounts, _cfgGreedHealth, _cfgCropProgress, _cfgPurseLink, _cfgChests, _cfgTechPoints, _cfgTeleporters, _cfgMap, _cfgMapEnemies, _cfgClassStats, _cfgCoins, _cfgTimeSeason, _cfgBellInstant;
+        private static ConfigEntry<bool> _cfgAllDefenses, _cfgOnlyBuilt, _cfgCamps, _cfgStatues, _cfgMounts, _cfgGreedHealth, _cfgCropProgress, _cfgPurseLink, _cfgChests, _cfgTechPoints, _cfgTeleporters, _cfgMap, _cfgMapEnemies, _cfgClassStats, _cfgCoins, _cfgTimeSeason, _cfgBellInstant, _cfgDisableWallQueue;
 
         /// <summary>绑定并读取持久化配置，使退出游戏后再次进入时恢复上次的开关设置。</summary>
         public static void InitConfig(ConfigFile config)
@@ -174,9 +176,10 @@ namespace BetterKingdom
             _cfgCoins = config.Bind("显示设置", "金币数量统计", false, "");
             _cfgTimeSeason = config.Bind("显示设置", "显示时间与季节", false, "");
             _cfgGreedHealth = config.Bind("显示设置", "显示怪物血条", false, "不会显示普通贪婪的血条");
-            _cfgCropProgress = config.Bind("显示设置", "显示作物生长进度条", false, "不会显示没有农民耕种的农田的进度条");
+            _cfgCropProgress = config.Bind("显示设置", "显示作物生长进度条", false, "");
             _cfgPurseLink = config.Bind("功能设置", "钱袋与国库共通", false, "钱袋金币数过多时将多余金币自动存入国库；钱袋为空时长按支付键可从国库中取出金币填满钱袋");
             _cfgBellInstant = config.Bind("功能设置", "摇铃后NPC立即上船", false, "");
+            _cfgDisableWallQueue = config.Bind("功能设置", "禁用排队机制", false, "");
             ShowAllDefenses = _cfgAllDefenses.Value;
             ShowOnlyBuiltDefenses = _cfgOnlyBuilt.Value;
             ShowAllCamps = _cfgCamps.Value;
@@ -194,6 +197,7 @@ namespace BetterKingdom
             ShowCoins = _cfgCoins.Value;
             ShowTimeSeason = _cfgTimeSeason.Value;
             BellInstantBoard = _cfgBellInstant.Value;
+            DisableWallQueue = _cfgDisableWallQueue.Value;
             HotkeyBindings.InitConfig(config);
         }
 
@@ -226,6 +230,7 @@ namespace BetterKingdom
             _cfgCoins.Value = ShowCoins;
             _cfgTimeSeason.Value = ShowTimeSeason;
             _cfgBellInstant.Value = BellInstantBoard;
+            _cfgDisableWallQueue.Value = DisableWallQueue;
         }
 
         /// <summary>开关项视觉引用（恢复默认时统一刷新颜色）。</summary>
@@ -600,13 +605,15 @@ namespace BetterKingdom
                     () => ShowCropProgress, v => ShowCropProgress = v);
                 _displayToggleCount = _toggles.Count;   // 显示页开关构建完毕，之后进入功能页
 
-                // ---- 功能设置页内容：可滚动视图 + 两个开关行（行样式与显示页完全一致） ----
-                float funcContentHeight = 28f + 2 * ToggleRowHeight + 1 * ToggleRowGap;
+                // ---- 功能设置页内容：可滚动视图 + 三个开关行（行样式与显示页完全一致） ----
+                float funcContentHeight = 28f + 3 * ToggleRowHeight + 2 * ToggleRowGap;
                 _funcScrollRect = CreateScrollContent(_page2.transform, funcContentHeight, out RectTransform funcContentRt);
                 BuildToggleRow(funcContentRt, srcButton, "钱袋与国库共通", ConfigDesc(_cfgPurseLink), 0, gameFont,
                     () => LinkPurseTreasury, v => LinkPurseTreasury = v);
                 BuildToggleRow(funcContentRt, srcButton, "摇铃后NPC立即上船", ConfigDesc(_cfgBellInstant), 1, gameFont,
                     () => BellInstantBoard, v => BellInstantBoard = v);
+                BuildToggleRow(funcContentRt, srcButton, "禁用排队机制", ConfigDesc(_cfgDisableWallQueue), 2, gameFont,
+                    () => DisableWallQueue, v => DisableWallQueue = v);
                 Sprite sbSprite = srcButton.image != null ? srcButton.image.sprite : null;
                 _toggleScrollbarGo = AttachScrollbar(panelGo.transform, _scrollRect, sbSprite);
                 _funcScrollbarGo = AttachScrollbar(panelGo.transform, _funcScrollRect, sbSprite);
@@ -738,8 +745,8 @@ namespace BetterKingdom
 
         /// <summary>
         /// 构建顶部活页索引页签（克隆游戏按钮缩小版）。
-        /// 配色：未选中暗、悬停/选中亮；选中页签由 ShowPage 置为 interactable=false，
-        /// 借 disabledColor 呈现常亮选中态。
+        /// 配色：未选中亮（凸起）、悬停更亮；选中页签由 ShowPage 置为 interactable=false，
+        /// 借 disabledColor 呈现常暗下沉态。
         /// </summary>
         private Button BuildTab(Transform parent, Button template, string label, Font uiFont, float width, Action onClick)
         {
@@ -764,10 +771,10 @@ namespace BetterKingdom
             tab.transition = Selectable.Transition.ColorTint;
             ColorBlock cb = tab.colors;
             cb.normalColor = TabNormalColor;
-            cb.highlightedColor = TabActiveColor;
+            cb.highlightedColor = TabHoverColor;
             cb.pressedColor = TabActiveColor;
-            cb.selectedColor = TabActiveColor;
-            cb.disabledColor = TabActiveColor;   // 选中态：interactable=false 时显示亮色
+            cb.selectedColor = TabNormalColor;
+            cb.disabledColor = TabActiveColor;   // 选中态：interactable=false 时显示暗色（下沉）
             cb.colorMultiplier = 1f;
             cb.fadeDuration = 0.08f;
             tab.colors = cb;
@@ -1225,7 +1232,7 @@ namespace BetterKingdom
             return _flatSlotSprite;
         }
 
-        /// <summary>切换分页：显示目标页，页签选中态通过 interactable 切换（选中页签常亮且不可再点）；滚动条随页切换显隐。</summary>
+        /// <summary>切换分页：显示目标页，页签选中态通过 interactable 切换（选中页签压暗且不可再点）；滚动条随页切换显隐。</summary>
         private void ShowPage(int index)
         {
             _pageIndex = index;
@@ -1355,7 +1362,7 @@ namespace BetterKingdom
             if (_confirmGo != null) { UnityEngine.Object.Destroy(_confirmGo); _confirmGo = null; }
         }
 
-        /// <summary>只恢复当前页设置为默认：显示页重置全部显示开关；功能页重置两个功能开关；快捷键页重置打开窗口键与全部游戏按键改绑。保持在当前页。</summary>
+        /// <summary>只恢复当前页设置为默认：显示页重置全部显示开关；功能页重置全部功能开关；快捷键页重置打开窗口键与全部游戏按键改绑。保持在当前页。</summary>
         private void RestoreCurrentPage()
         {
             if (_pageIndex == 0)
@@ -1371,7 +1378,7 @@ namespace BetterKingdom
             }
             else if (_pageIndex == 1)
             {
-                LinkPurseTreasury = BellInstantBoard = false;
+                LinkPurseTreasury = BellInstantBoard = DisableWallQueue = false;
                 for (int i = _displayToggleCount; i < _toggles.Count; i++)
                     if (_toggles[i].Fill != null) _toggles[i].Fill.color = ToggleOffColor;
                 SaveSettings();
