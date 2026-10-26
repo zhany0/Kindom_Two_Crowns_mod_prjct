@@ -25,6 +25,8 @@ namespace BetterKingdom
         private const float MediumRefreshInterval = 0.25f;
         private const float HeavyRefreshInterval = 2f;
         private const float DotRadius = 7f;
+        private const float EnemyLineSmoothSpeed = 50f;    // 怪物竖线平滑速度（世界单位/秒），消除阶跃瞬移
+        private const int EnemySideHysteresis = 2;         // 侧别切换滞回（多数侧需多出该数量才切换）
         private const int LabelFontSize = 18;
         private const int InfoFontSize = 20;
         private const int JobFontSize = 20;
@@ -50,8 +52,12 @@ namespace BetterKingdom
         private readonly List<MapMarker> _mountMarkers = new();
         private readonly List<MapMarker> _chestMarkers = new();
         private readonly List<MapMarker> _techMarkers = new();
-        private Texture2D _texCamp, _texStatue, _texMount, _texChest, _texTech;
-        private GUIStyle _styleCamp, _styleStatue, _styleMount, _styleChest, _styleTech;
+        // 双向传送门成对连线（A/B 为两端世界X；Level 为引导线分层，避免多组连线在同一高度重合）
+        private struct TeleLink { public float A; public float B; public int Level; }
+        private readonly List<float> _teleporterX = new();
+        private readonly List<TeleLink> _teleLinks = new();
+        private Texture2D _texCamp, _texStatue, _texMount, _texChest, _texTech, _texTeleporter, _texTeleLink;
+        private GUIStyle _styleCamp, _styleStatue, _styleMount, _styleChest, _styleTech, _styleTeleporter, _styleTeleLink;
 
         // 世界空间悬浮条（怪物血条/作物生长进度）
         private Texture2D _texBarBg, _texHpFill, _texCropFill;
@@ -78,6 +84,12 @@ namespace BetterKingdom
         //   怪物波次竖线（每批怪物一条，存代表怪的世界X坐标）  
         private readonly List<float> _enemyLineX = new();
         private float _minX, _maxX;
+        // 世界边界缓存：仅关卡加载时计算一次，读取失败期间沿用上次有效值，避免整张地图比例来回跳变
+        private float _boundLeft, _boundRight;
+        // 关卡地面原始边界 + 洞窟侧裁剪标记：地面会延伸到悬崖内部，只按洞窟坐标裁剪一次，洞窟被炸后不再回弹
+        private float _rawBoundLeft, _rawBoundRight;
+        private bool _caveTrimmed;
+        private bool _boundsReady;
         private bool _hasData;
         private float _nextLightRefresh, _nextMediumRefresh, _nextHeavyRefresh;
 
@@ -95,21 +107,23 @@ namespace BetterKingdom
 
         //   怪物扫描复用缓冲（消除 50Hz 下的数组/字典分配）  
         private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _enemyBuffer;
-        private readonly List<WaveGroup> _waveGroups = new();
+        private readonly Dictionary<uint, WaveGroup> _waveGroups = new();   // 按 waveID 分组，跨帧保留同一波的平滑位置
+        private readonly List<uint> _staleWaveIds = new();                  // 本帧已消失的波次ID（遍历后再删除）
 
-        /// <summary>一波怪物的聚合数据（对象池复用，避免频繁分配）。</summary>
+        /// <summary>一波怪物的聚合数据（按 waveID 缓存，避免频繁分配）。</summary>
         private sealed class WaveGroup
         {
-            public uint Id;
-            public float Min, Max, Sum;
-            public int Count;
-            public void Reset(uint id, float x) { Id = id; Min = x; Max = x; Sum = x; Count = 1; }
+            public float Min, Max;
+            public int LeftCount, RightCount;   // 本帧以城堡为界的左右两侧数量（判定本波属于哪一侧）
+            public int Side;                    // 0=未判定 1=左侧 2=右侧（带滞回，避免分界处来回切换）
+            public float Shown;                 // 已平滑的显示坐标（世界X）
+            public bool Seen;                   // 本帧是否已统计（Min/Max 必须每帧重算，不能沿用历史极值）
+            public void Reset(float x) { Min = x; Max = x; LeftCount = 0; RightCount = 0; Side = 0; Shown = x; Seen = true; }
+            public void Begin(float x) { Min = x; Max = x; LeftCount = 0; RightCount = 0; Seen = true; }
             public void Add(float x)
             {
                 if (x < Min) Min = x;
                 if (x > Max) Max = x;
-                Sum += x;
-                Count++;
             }
         }
 
@@ -145,17 +159,19 @@ namespace BetterKingdom
         private void Awake()
         {
             _texYellow = MakeSolidTexture(new Color(1f, 0.9f, 0.15f, 1f));
-            _texPlayer = MakeSolidTexture(new Color(0.2f, 1f, 1f, 1f));
+            _texPlayer = MakeSolidTexture(new Color(0.25f, 1f, 0.35f, 1f));    // 玩家：绿
             _texPortal = MakeSolidTexture(new Color(1f, 0.25f, 0.2f, 1f));
-            _texWall = MakeSolidTexture(new Color(0.35f, 0.6f, 1f, 1f));
-            _texTower = MakeSolidTexture(new Color(0.4f, 1f, 0.4f, 1f));
-            _texEnemy = MakeSolidTexture(new Color(0.95f, 0.3f, 1f, 1f));
+            _texWall = MakeSolidTexture(new Color(0.62f, 0.62f, 0.66f, 1f));   // 城墙：灰
+            _texTower = MakeSolidTexture(new Color(0.76f, 0.55f, 0.32f, 1f));  // 箭塔：木色
+            _texEnemy = MakeSolidTexture(new Color(0.55f, 0.15f, 0.75f, 1f));  // 怪物竖线：较深紫
             _texCastle = MakeSolidTexture(new Color(1f, 1f, 1f, 1f));
             _texCamp = MakeSolidTexture(new Color(0.95f, 0.55f, 0.15f, 1f));   // 难民营：橙
-            _texStatue = MakeSolidTexture(new Color(1f, 0.85f, 0.25f, 1f));   // 雕像：金
-            _texMount = MakeSolidTexture(new Color(1f, 0.45f, 0.65f, 1f));    // 坐骑出生点：粉
+            _texStatue = MakeSolidTexture(new Color(0.55f, 0.72f, 0.6f, 1f));  // 雕像：灰绿
+            _texMount = MakeSolidTexture(new Color(0f, 0.5f, 0.25f, 1f));      // 坐骑出生点：深绿
             _texChest = MakeSolidTexture(new Color(1f, 0.78f, 0.1f, 1f));    // 宝箱：金
-            _texTech = MakeSolidTexture(new Color(0.6f, 0.6f, 0.62f, 1f));   // 科技解锁点：灰
+            _texTech = MakeSolidTexture(new Color(0.3f, 0.55f, 1f, 1f));      // 科技解锁点：蓝
+            _texTeleporter = MakeSolidTexture(new Color(0.42f, 0.6f, 0.95f, 1f));   // 自建传送门：偏蓝的灰蓝
+            _texTeleLink = MakeSolidTexture(new Color(0.5f, 0.68f, 1f, 1f));       // 双向传送门连线：与传送门相近、略亮
             _texBarBg = MakeSolidTexture(new Color(0f, 0f, 0f, 0.65f));       // 悬浮条底：半透明黑
             _texHpFill = MakeSolidTexture(new Color(0.85f, 0.15f, 0.2f, 1f)); // 怪物血条：红
             _texCropFill = MakeSolidTexture(new Color(0.35f, 0.85f, 0.3f, 1f)); // 作物进度：绿
@@ -172,6 +188,8 @@ namespace BetterKingdom
             _styleMount = MakeSolidStyle(_texMount);
             _styleChest = MakeSolidStyle(_texChest);
             _styleTech = MakeSolidStyle(_texTech);
+            _styleTeleporter = MakeSolidStyle(_texTeleporter);
+            _styleTeleLink = MakeSolidStyle(_texTeleLink);
             _styleBarBg = MakeSolidStyle(_texBarBg);
             _styleHpFill = MakeSolidStyle(_texHpFill);
             _styleCropFill = MakeSolidStyle(_texCropFill);
@@ -240,6 +258,8 @@ namespace BetterKingdom
             DestroyImmediate(_texMount);
             DestroyImmediate(_texChest);
             DestroyImmediate(_texTech);
+            DestroyImmediate(_texTeleporter);
+            DestroyImmediate(_texTeleLink);
             DestroyImmediate(_texBarBg);
             DestroyImmediate(_texHpFill);
             DestroyImmediate(_texCropFill);
@@ -316,12 +336,19 @@ namespace BetterKingdom
                     {
                         _gameTime = director.currentTime;
 
-                        // 季节与季节内天数（每季 16 天，由统治累计天数推算，换岛不重置）
+                        // 季节与季节内天数：直接使用游戏的季节日历（关卡 LandData 数据驱动，默认每季 16 天）
                         try
                         {
                             int day = GetDayNumber(director);
-                            _season = GetSeason(director, day);
-                            _seasonDay = GetSeasonDay(director, day);
+                            // 游戏天数在午夜 0 点递增，这里把换日推迟到清晨（白天开始、怪物撤退/自动存档的时刻）：
+                            // 午夜到清晨之间仍显示前一天的天数与季节
+                            if (day > 0 && _gameTime < GetMorningHour(director)) day--;
+                            if (day < 0) day = 0;
+                            if (!TryGetSeasonFromLand(director, day, out _season, out _seasonDay))
+                            {
+                                _season = GetSeason(director, day);
+                                _seasonDay = GetSeasonDay(director, day);
+                            }
                             _hasSeason = true;
                         }
                         catch { _hasSeason = false; }
@@ -511,8 +538,10 @@ namespace BetterKingdom
                     _enemyBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy>(Math.Max(count, 16));
                 all.CopyTo(_enemyBuffer, 0);
 
-                // 按 waveID 分组，组对象复用（波次很少，线性查找即可，避免字典分配）
-                int groupCount = 0;
+                // 按 waveID 分组：字典跨帧保留同一波次，平滑位置与侧别才能延续；
+                // 每帧先把所有分组的“已统计”标记清零，Min/Max 必须按本帧怪物重算
+                foreach (KeyValuePair<uint, WaveGroup> kv in _waveGroups) kv.Value.Seen = false;
+
                 for (int i = 0; i < count; i++)
                 {
                     Enemy e = _enemyBuffer[i];
@@ -559,38 +588,53 @@ namespace BetterKingdom
                     uint id;
                     try { id = e.waveID; } catch { id = 0u; }
 
-                    WaveGroup g = null;
-                    for (int j = 0; j < groupCount; j++)
+                    WaveGroup g;
+                    if (!_waveGroups.TryGetValue(id, out g))
                     {
-                        if (_waveGroups[j].Id == id) { g = _waveGroups[j]; break; }
+                        g = new WaveGroup();
+                        g.Reset(x);          // 全新一波：侧别与平滑起点重新初始化
+                        _waveGroups.Add(id, g);
                     }
-                    if (g == null)
+                    else if (!g.Seen)
                     {
-                        if (groupCount < _waveGroups.Count)
-                        {
-                            g = _waveGroups[groupCount];
-                            g.Reset(id, x);
-                        }
-                        else
-                        {
-                            g = new WaveGroup();
-                            g.Reset(id, x);
-                            _waveGroups.Add(g);
-                        }
-                        groupCount++;
+                        g.Begin(x);          // 同一波跨帧延续：只重置本帧统计，保留侧别与平滑位置
                     }
                     else
                     {
                         g.Add(x);
                     }
+
+                    // 按城堡分界统计本波怪物落在左右两侧的数量，用于稳定判定本波属于哪一侧
+                    if (x >= divider) g.RightCount++;
+                    else g.LeftCount++;
                 }
 
-                for (int j = 0; j < groupCount; j++)
+                // 移除本帧已不存在的波次，避免残留位置被后续波次复用
+                _staleWaveIds.Clear();
+                foreach (KeyValuePair<uint, WaveGroup> kv in _waveGroups)
                 {
-                    WaveGroup g = _waveGroups[j];
-                    float avg = g.Sum / g.Count;
-                    // 右侧出怪显示最左侧怪的位置，左侧出怪显示最右侧怪的位置
-                    _enemyLineX.Add(avg >= divider ? g.Min : g.Max);
+                    if (!kv.Value.Seen) _staleWaveIds.Add(kv.Key);
+                }
+                for (int i = 0; i < _staleWaveIds.Count; i++) _waveGroups.Remove(_staleWaveIds[i]);
+
+                float moveStep = Time.unscaledDeltaTime * EnemyLineSmoothSpeed;
+                foreach (KeyValuePair<uint, WaveGroup> kv in _waveGroups)
+                {
+                    WaveGroup g = kv.Value;
+
+                    // 侧别带滞回：多数侧明显反超才切换，避免同波怪物跨城堡分界时竖线在左右端之间来回跳
+                    if (g.Side == 0)
+                        g.Side = g.RightCount >= g.LeftCount ? 2 : 1;
+                    else if (g.Side == 2 && g.LeftCount > g.RightCount + EnemySideHysteresis)
+                        g.Side = 1;
+                    else if (g.Side == 1 && g.RightCount > g.LeftCount + EnemySideHysteresis)
+                        g.Side = 2;
+
+                    // 右侧出怪显示最左侧怪的位置，左侧出怪显示最右侧怪的位置；
+                    // 最近怪物死亡或被新兵替换时目标会阶跃，这里按固定速度平滑移动，避免竖线瞬移
+                    float target = g.Side == 2 ? g.Min : g.Max;
+                    g.Shown = Mathf.MoveTowards(g.Shown, target, moveStep);
+                    _enemyLineX.Add(g.Shown);
                 }
             }
             catch { }
@@ -614,27 +658,32 @@ namespace BetterKingdom
                 _portalX.Clear();
                 _caveX.Clear();
                 _wallX.Clear();
-                _hoverAnim.Clear();
+                _teleporterX.Clear();
+                _teleLinks.Clear();
+                // 悬停动画不再每次重刷新清空（否则鼠标停在标记上时标记会周期性缩回再放大），仅在键数量异常增长时清理
+                if (_hoverAnim.Count > 512) _hoverAnim.Clear();
 
                 float minX = float.MaxValue;
                 float maxX = float.MinValue;
 
                 World world = managers.world;
                 bool boundsValid = false;
-                if (world != null)
+                if (TryGetWorldBounds(world, out float boundLeft, out float boundRight))
                 {
-                    try
+                    // 地图范围只由关卡地面决定，不参与任何地图标记的计算，避免开关标记时整图比例变化
+                    if (!_boundsReady || Math.Abs(boundLeft - _rawBoundLeft) > 1f || Math.Abs(boundRight - _rawBoundRight) > 1f)
                     {
-                        Sided<float> bounds = world.worldBounds;
-                        if (bounds != null && bounds.right - bounds.left > 10f)
-                        {
-                            minX = bounds.left;
-                            maxX = bounds.right;
-                            boundsValid = true;
-                        }
+                        // 换关卡：还原地面原始边界，允许重新按洞窟位置裁剪
+                        _rawBoundLeft = boundLeft;
+                        _rawBoundRight = boundRight;
+                        _boundLeft = boundLeft;
+                        _boundRight = boundRight;
+                        _caveTrimmed = false;
                     }
-                    catch { }
+                    _boundsReady = true;
                 }
+                // 读取失败（加载切换等瞬间）时沿用上次有效边界，避免退化成按玩家位置估算导致全部标记左右平移
+                if (_boundsReady) boundsValid = true;
 
                 if (!boundsValid)
                 {
@@ -678,6 +727,33 @@ namespace BetterKingdom
                 }
                 catch { }
 
+                // 洞窟侧的地面会一直延伸到悬崖后方，按洞窟位置裁掉这段无用区域，避免该侧地图留空过大。
+                // 只在当前关卡首次拿到洞窟坐标时裁一次：洞窟被炸掉后不再回弹到地面原始边界。
+                if (_boundsReady && !_caveTrimmed && _caveX.Count > 0)
+                {
+                    float edgePad = 0.005f * (_rawBoundRight - _rawBoundLeft);
+                    float midBound = (_rawBoundLeft + _rawBoundRight) * 0.5f;
+                    foreach (float caveX in _caveX)
+                    {
+                        if (caveX < midBound) _boundLeft = Math.Max(_boundLeft, caveX - edgePad);
+                        else _boundRight = Math.Min(_boundRight, caveX + edgePad);
+                    }
+                    // 裁剪异常（左右交叉）时回退到地面原始边界
+                    if (_boundLeft >= _boundRight)
+                    {
+                        _boundLeft = _rawBoundLeft;
+                        _boundRight = _rawBoundRight;
+                    }
+                    _caveTrimmed = true;
+                }
+
+                // 边界确定后作为范围基准（此时裁剪已完成）
+                if (boundsValid)
+                {
+                    minX = _boundLeft;
+                    maxX = _boundRight;
+                }
+
                 CollectWallAndTowerMarkers(kingdom, boundsValid, ref minX, ref maxX);
 
                 // 功能开关控制的额外标记：仅开关开启时收集（关闭时清空不绘制）
@@ -691,6 +767,7 @@ namespace BetterKingdom
                 if (ModWindowBehaviour.ShowMountSpawns) CollectMountMarkers();
                 if (ModWindowBehaviour.ShowChests) CollectChestMarkers();
                 if (ModWindowBehaviour.ShowTechPoints) CollectTechMarkers();
+                if (ModWindowBehaviour.ShowTeleporters) CollectTeleporters(world);
 
                 _hasData = minX < maxX;
                 if (!_hasData) return;
@@ -700,6 +777,50 @@ namespace BetterKingdom
                 _maxX = maxX + pad;
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 读取关卡真实左右边界，供地图坐标映射使用。
+        /// 优先取 World.GroundCollider 的世界包围盒（游戏就是用地面碰撞体计算 worldBounds 的），
+        /// 其次读 World.worldBounds；两者都拿不到才返回 false（由调用方回退到按标记估算）。
+        /// </summary>
+        private static bool TryGetWorldBounds(World world, out float left, out float right)
+        {
+            left = 0f;
+            right = 0f;
+
+            // GroundCollider 是 World 的静态成员：即当前关卡地面碰撞体
+            try
+            {
+                BoxCollider2D ground = World.GroundCollider;
+                if (ground != null)
+                {
+                    Bounds bounds = ground.bounds;
+                    if (bounds.size.x > 10f)
+                    {
+                        left = bounds.min.x;
+                        right = bounds.max.x;
+                        return true;
+                    }
+                }
+            }
+            catch { }
+
+            if (world == null) return false;
+
+            try
+            {
+                Sided<float> bounds = world.worldBounds;
+                if (bounds != null && bounds.right - bounds.left > 10f)
+                {
+                    left = bounds.left;
+                    right = bounds.right;
+                    return true;
+                }
+            }
+            catch { }
+
+            return false;
         }
 
         /// <summary>检查 worldX 是否与 caveX 列表中的任何坐标重合（距离<1）。</summary>
@@ -1230,6 +1351,99 @@ namespace BetterKingdom
             catch { }
         }
 
+        /// <summary>
+        /// 收集自建传送门：World.teleporters 中的 PayableTeleporter。
+        /// linkedTo 为空 = 普通传送门（可在地图任意位置往返穿梭）；
+        /// linkedTo 非空 = 双向传送门（由传送裂缝建成，只能在两端之间定点穿梭），成对记录连线。
+        /// 注意：这里不参与地图范围计算，否则开关本选项会让整张地图比例发生变化。
+        /// </summary>
+        private void CollectTeleporters(World world)
+        {
+            try
+            {
+                var teleporters = world != null ? world.teleporters : null;
+                if (teleporters == null) return;
+
+                foreach (PayableTeleporter tp in teleporters)
+                {
+                    if (tp == null || !TryGetX(tp, out float x)) continue;
+
+                    _teleporterX.Add(x);
+
+                    PayableTeleporter linked = null;
+                    try { linked = tp.linkedTo; } catch { }
+                    if (linked == null || !TryGetX(linked, out float lx)) continue;
+
+                    // 双向传送门两端互指，同一对只记录一次连线（按坐标排序后去重）
+                    float a = Math.Min(x, lx);
+                    float b = Math.Max(x, lx);
+                    bool exists = false;
+                    for (int i = 0; i < _teleLinks.Count; i++)
+                    {
+                        if (Math.Abs(_teleLinks[i].A - a) < 0.01f && Math.Abs(_teleLinks[i].B - b) < 0.01f)
+                        {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) _teleLinks.Add(new TeleLink { A = a, B = b });
+                }
+
+                AssignTeleLinkLevels();
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 给每组双向传送门连线分配一个引导线层级：横向区间重叠的连线放到不同层，
+        /// 绘制时外层（层级小）画在上方、内层（层级大）画在下方，避免多组连线重合而无法区分配对。
+        /// </summary>
+        private void AssignTeleLinkLevels()
+        {
+            if (_teleLinks.Count <= 1)
+            {
+                if (_teleLinks.Count == 1)
+                {
+                    TeleLink only = _teleLinks[0];
+                    only.Level = 0;
+                    _teleLinks[0] = only;
+                }
+                return;
+            }
+
+            // 按左端点（再按右端点）排序，保证每次重刷新后的分层结果稳定
+            _teleLinks.Sort((p, q) =>
+            {
+                int cmp = p.A.CompareTo(q.A);
+                return cmp != 0 ? cmp : p.B.CompareTo(q.B);
+            });
+
+            for (int i = 0; i < _teleLinks.Count; i++)
+            {
+                TeleLink cur = _teleLinks[i];
+                int level = 0;
+                while (true)
+                {
+                    bool clash = false;
+                    for (int j = 0; j < i; j++)
+                    {
+                        TeleLink prev = _teleLinks[j];
+                        if (prev.Level != level) continue;
+                        // 区间相交（含嵌套）：与同层已有连线重叠则换下一层
+                        if (cur.A < prev.B && prev.A < cur.B)
+                        {
+                            clash = true;
+                            break;
+                        }
+                    }
+                    if (!clash) break;
+                    level++;
+                }
+                cur.Level = level;
+                _teleLinks[i] = cur;
+            }
+        }
+
         /// <summary>坐骑类型枚举 → 中文名称。</summary>
         private static string SteedName(SteedType t)
         {
@@ -1359,6 +1573,15 @@ namespace BetterKingdom
                     DrawDotWithLabel(x, centerY, DotRadius - 1f, _stylePortal, "传送门");
                 foreach (float x in _caveX)
                     DrawDotWithLabel(x, centerY, DotRadius - 1f, _stylePortal, "洞窟");
+                // 双向传送门连线先画（位于标记上方），再画传送门标记
+                // 横向区间重叠的连线已分层，这里按最大层数把它们展开到不同高度
+                int maxLinkLevel = 0;
+                foreach (TeleLink link in _teleLinks)
+                    if (link.Level > maxLinkLevel) maxLinkLevel = link.Level;
+                foreach (TeleLink link in _teleLinks)
+                    DrawTeleLink(link, centerY, maxLinkLevel);
+                foreach (float x in _teleporterX)
+                    DrawDotWithLabel(x, centerY, DotRadius - 1f, _styleTeleporter, "传送门");
                 // 箭塔与城墙："只显示已建造"开启时过滤掉建造位与建造中（标签含"建造"）的标记
                 if (ModWindowBehaviour.ShowAllDefenses)
                 {
@@ -1454,6 +1677,40 @@ namespace BetterKingdom
             return LeftMargin + Mathf.Clamp01(t) * usable;
         }
 
+        /// <summary>
+        /// 绘制双向传送门连线：两点各自向上引一小段竖线，再由顶部横线相连（样式参考游戏内传送门连线）。
+        /// 多组连线横向重叠时按 Level 抬高顶部横线，高度不同即可区分各自配对，颜色保持不变。
+        /// </summary>
+        private void DrawTeleLink(TeleLink link, float centerY, int maxLevel)
+        {
+            float ax = ToScreenX(link.A);
+            float bx = ToScreenX(link.B);
+            if (Mathf.Abs(bx - ax) < 1f) return;
+
+            const float halfW = 1f;                       // 线宽的一半（总宽 2 像素）
+            const float baseGap = 8f;                     // 单组连线时竖线高度（标记上缘到顶部横线的距离）
+            float dotTop = centerY - (DotRadius - 1f);    // 标记点（半径 DotRadius-1）的上缘
+
+            // 多层时在标记上方可用高度内均匀排开，保证最高一层也留在屏幕内
+            float step = 0f;
+            if (maxLevel > 0)
+            {
+                float available = Mathf.Max(4f, dotTop - 2f - baseGap);
+                step = Mathf.Min(7f, available / maxLevel);
+            }
+            // 层级越小越靠外：外层画得更高、内层画得更低（贴近标记），形成套叠的括号；
+            // 这样内层竖线不会穿过外层的横线。部分重叠（一外一内）按分层顺序各自错开高度。
+            float linkY = dotTop - baseGap - (maxLevel - link.Level) * step;
+
+            // 两端竖线
+            GUI.Box(new Rect(ax - halfW, linkY, halfW * 2f, dotTop - linkY), GUIContent.none, _styleTeleLink);
+            GUI.Box(new Rect(bx - halfW, linkY, halfW * 2f, dotTop - linkY), GUIContent.none, _styleTeleLink);
+            // 顶部横线（左右各外扩半线宽，与竖线形成折角）
+            float left = Mathf.Min(ax, bx) - halfW;
+            GUI.Box(new Rect(left, linkY - halfW, Mathf.Abs(bx - ax) + halfW * 2f, halfW * 2f),
+                GUIContent.none, _styleTeleLink);
+        }
+
         /// <summary>绘制怪物位置竖线（贯穿地图框高度），悬停时在线下方显示标签。</summary>
         private void DrawEnemyLine(float worldX, float frameH)
         {
@@ -1524,11 +1781,53 @@ namespace BetterKingdom
 
         // ==================== 季节时钟（覆盖层左下角时间/季节显示） ====================
 
-        private const int DaysPerSeason = 16;   // 每季 16 天
+        private const int DaysPerSeason = 16;   // 兜底用：默认关卡每季 16 天（14 常规 + 1 血月 + 1 恢复）
+        private const float DefaultMorningHour = 5f;   // 缺省清晨时刻：游戏白天起点（怪物撤退/自动存档）
 
-        /// <summary>统治累计天数（换岛不重置，从 1 开始）；取不到时回退到导演当前天数，均失败返回 0。</summary>
+        /// <summary>
+        /// 清晨换日时刻：优先取 Director.dayStart（游戏判定白天开始的时间，约 5 点），
+        /// 取不到时退回当前 TimesOfDay 的黎明开始时间，再取默认值。
+        /// </summary>
+        private static float GetMorningHour(Director director)
+        {
+            if (director != null)
+            {
+                try
+                {
+                    float dayStart = director.dayStart;
+                    if (dayStart > 0f && dayStart < 24f) return dayStart;
+                }
+                catch { }
+                try
+                {
+                    TimesOfDay tod = director.CurrentTimesOfDay;
+                    if (tod != null)
+                    {
+                        float dawn = tod.dawnStart;
+                        if (dawn > 0f && dawn < 24f) return dawn;
+                    }
+                }
+                catch { }
+            }
+            return DefaultMorningHour;
+        }
+
+        /// <summary>
+        /// 统治累计天数（换岛不重置）：优先取 Director.TotalDaysInReign，这是游戏季节日历使用的日序号；
+        /// 换岛加载瞬间该字段可能为 0，此时回退到存档级的战役累计天数 +1，避免日期跳变；均失败返回 -1。
+        /// </summary>
         private static int GetDayNumber(Director director)
         {
+            try
+            {
+                if (director != null)
+                {
+                    int day = director.TotalDaysInReign;
+                    if (day > 0) return day;
+                }
+            }
+            catch { }
+
             try
             {
                 CampaignSaveData save = CampaignSaveData.current;
@@ -1540,25 +1839,50 @@ namespace BetterKingdom
             }
             catch { }
 
-            try
-            {
-                if (director != null)
-                {
-                    int day = director.CurrentDaysSinceFirstLandingThisReign;
-                    if (day > 0) return day;
-                }
-            }
-            catch { }
-
-            return 0;
+            return -1;
         }
 
-        /// <summary>按累计天数推算季节（季节枚举值 1/2/4/8 分别对应夏/秋/冬/春）；以秋天开局时整体后移两个季度。</summary>
+        /// <summary>
+        /// 用关卡自身的季节日历取季与季内天数（LandData/SeasonData 数据驱动，默认每季 16 天）。
+        /// 日序号与游戏一致：TotalDaysInReign 从 0 开始，季节起始日为 16 的整数倍；
+        /// 季内天数 = 日序号 - 当季起始日 + 1，取值 1..TotalNumDays。
+        /// </summary>
+        private static bool TryGetSeasonFromLand(Director director, int day, out Season season, out int seasonDay)
+        {
+            season = (Season)8;
+            seasonDay = 0;
+            if (director == null || day < 0) return false;
+
+            try
+            {
+                CycleData.LandData land = director.LandCycleData;
+                if (land == null) return false;
+
+                // 代理程序集里 byref 参数暴露为 ref（不是 out）
+                int startDay = 0;
+                CycleData.SeasonData data = land.GetSeasonForDay(day, ref startDay);
+                if (data == null) return false;
+
+                int total = data.TotalNumDays;
+                int current = day - startDay + 1;
+                if (total <= 0 || current < 1 || current > total) return false;
+
+                season = data.season;
+                seasonDay = current;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// 兜底：按 0 基日序号直接推算季节（默认每季 16 天，一年从春天开始）；
+        /// 拿到 LandCycleData 时不会走到这里。
+        /// </summary>
         private static Season GetSeason(Director director, int day)
         {
-            if (day > 0)
+            if (day >= 0)
             {
-                int index = (day - 1) / DaysPerSeason;
+                int index = day / DaysPerSeason;
                 try
                 {
                     if (director != null && director.startGameInAutumn) index += 2;
@@ -1583,14 +1907,17 @@ namespace BetterKingdom
             return (Season)8;
         }
 
-        /// <summary>季节内第几天（1-16）；取不到累计天数时回退到导演当前季节天数。</summary>
+        /// <summary>
+        /// 兜底：季内第几天（1..16）。游戏日序号从 0 开始，所以是 day % 16 + 1，不能再减 1。
+        /// </summary>
         private static int GetSeasonDay(Director director, int day)
         {
-            if (day > 0) return (day - 1) % DaysPerSeason + 1;
+            if (day >= 0) return day % DaysPerSeason + 1;
 
             try
             {
-                if (director != null) return director.CurrentSeasonDay;
+                if (director != null && director.CurrentSeasonStartDay >= 0)
+                    return director.TotalDaysInReign - director.CurrentSeasonStartDay + 1;
             }
             catch { }
 

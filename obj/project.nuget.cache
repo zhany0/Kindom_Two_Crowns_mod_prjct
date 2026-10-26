@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "NWAPcsCPjGyARdrkM5qgXSk1BWaTHkPvnjxBJhHzLFZwOdcWI3x1M8QXodS1aWWiU4VR2Ai+5DbejF3mb98iwA==",
+  "dgSpecHash": "ItLcWpL1vgbNj951qlhsNxnejuJJIT10rgVqtQZM87lUGeWCve8lw58fvA5tPomMz4i19RHp0W2Fb0VuEAR5/w==",
   "success": true,
-  "projectFilePath": "d:\\KingdomMod\\code2git\\BetterKingdom.csproj",
+  "projectFilePath": "D:\\KingdomMod\\code2git\\BetterKingdom.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\23005\\.nuget\\packages\\bepinex.plugininfoprops\\1.1.0\\bepinex.plugininfoprops.1.1.0.nupkg.sha512"
   ],

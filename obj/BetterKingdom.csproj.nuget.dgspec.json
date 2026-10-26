@@ -1,20 +1,20 @@
 {
   "format": 1,
   "restore": {
-    "d:\\KingdomMod\\code2git\\BetterKingdom.csproj": {}
+    "D:\\KingdomMod\\code2git\\BetterKingdom.csproj": {}
   },
   "projects": {
-    "d:\\KingdomMod\\code2git\\BetterKingdom.csproj": {
+    "D:\\KingdomMod\\code2git\\BetterKingdom.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "d:\\KingdomMod\\code2git\\BetterKingdom.csproj",
+        "projectUniqueName": "D:\\KingdomMod\\code2git\\BetterKingdom.csproj",
         "projectName": "BetterKingdom",
-        "projectPath": "d:\\KingdomMod\\code2git\\BetterKingdom.csproj",
+        "projectPath": "D:\\KingdomMod\\code2git\\BetterKingdom.csproj",
         "packagesPath": "C:\\Users\\23005\\.nuget\\packages\\",
-        "outputPath": "d:\\KingdomMod\\code2git\\obj\\",
+        "outputPath": "D:\\KingdomMod\\code2git\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
-          "d:\\KingdomMod\\code2git\\NuGet.Config",
+          "D:\\KingdomMod\\code2git\\NuGet.Config",
           "C:\\Users\\23005\\AppData\\Roaming\\NuGet\\NuGet.Config"
         ],
         "originalTargetFrameworks": [

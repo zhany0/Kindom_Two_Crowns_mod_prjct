@@ -11,3 +11,16 @@ d:\KingdomMod\BetterKingdom project\obj\Release\net6.0\BetterKingdom.dll
 d:\KingdomMod\BetterKingdom project\obj\Release\net6.0\refint\BetterKingdom.dll
 d:\KingdomMod\BetterKingdom project\obj\Release\net6.0\BetterKingdom.pdb
 d:\KingdomMod\BetterKingdom project\obj\Release\net6.0\ref\BetterKingdom.dll
+D:\KingdomMod\code2git\bin\Release\net6.0\BetterKingdom.deps.json
+D:\KingdomMod\code2git\bin\Release\net6.0\BetterKingdom.dll
+D:\KingdomMod\code2git\bin\Release\net6.0\BetterKingdom.pdb
+D:\KingdomMod\code2git\obj\Release\net6.0\BetterKingdom.csproj.AssemblyReference.cache
+D:\KingdomMod\code2git\obj\Release\net6.0\PluginInfo.cs
+D:\KingdomMod\code2git\obj\Release\net6.0\BetterKingdom.GeneratedMSBuildEditorConfig.editorconfig
+D:\KingdomMod\code2git\obj\Release\net6.0\BetterKingdom.AssemblyInfoInputs.cache
+D:\KingdomMod\code2git\obj\Release\net6.0\BetterKingdom.AssemblyInfo.cs
+D:\KingdomMod\code2git\obj\Release\net6.0\BetterKingdom.csproj.CoreCompileInputs.cache
+D:\KingdomMod\code2git\obj\Release\net6.0\BetterKingdom.dll
+D:\KingdomMod\code2git\obj\Release\net6.0\refint\BetterKingdom.dll
+D:\KingdomMod\code2git\obj\Release\net6.0\BetterKingdom.pdb
+D:\KingdomMod\code2git\obj\Release\net6.0\ref\BetterKingdom.dll

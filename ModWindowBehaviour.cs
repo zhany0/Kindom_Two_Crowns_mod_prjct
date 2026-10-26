@@ -144,6 +144,7 @@ namespace BetterKingdom
         public static bool LinkPurseTreasury; // 钱袋与国库共通（溢出自动存入/空袋长按支付键取出）
         public static bool ShowChests;        // 显示宝箱（金币宝箱/宝石宝箱）
         public static bool ShowTechPoints;    // 显示科技解锁点（石器科技/铁器科技）
+        public static bool ShowTeleporters;   // 显示自建传送门（普通传送门/双向传送门）
         public static bool ShowMap;           // 地图显示（总开关：关闭时整张地图与全部地图标记隐藏，子选项不生效）
         public static bool ShowMapEnemies;    // 地图显示怪物位置（紫色竖线）
         public static bool ShowClassStats;    // 职业显示
@@ -152,7 +153,7 @@ namespace BetterKingdom
         public static bool BellInstantBoard;  // 摇铃后被召唤的职业立即传送上船（省去跑动，不影响玩家）
 
         // ---- 持久化配置项（Plugin.Load 时绑定并读取；ConfigEntry 赋值即自动写盘） ----
-        private static ConfigEntry<bool> _cfgAllDefenses, _cfgOnlyBuilt, _cfgCamps, _cfgStatues, _cfgMounts, _cfgGreedHealth, _cfgCropProgress, _cfgPurseLink, _cfgChests, _cfgTechPoints, _cfgMap, _cfgMapEnemies, _cfgClassStats, _cfgCoins, _cfgTimeSeason, _cfgBellInstant;
+        private static ConfigEntry<bool> _cfgAllDefenses, _cfgOnlyBuilt, _cfgCamps, _cfgStatues, _cfgMounts, _cfgGreedHealth, _cfgCropProgress, _cfgPurseLink, _cfgChests, _cfgTechPoints, _cfgTeleporters, _cfgMap, _cfgMapEnemies, _cfgClassStats, _cfgCoins, _cfgTimeSeason, _cfgBellInstant;
 
         /// <summary>绑定并读取持久化配置，使退出游戏后再次进入时恢复上次的开关设置。</summary>
         public static void InitConfig(ConfigFile config)
@@ -167,6 +168,7 @@ namespace BetterKingdom
             _cfgMounts = config.Bind("显示设置", "显示坐骑出生点", false, "");
             _cfgChests = config.Bind("显示设置", "显示未开启的宝箱", false, "");
             _cfgTechPoints = config.Bind("显示设置", "显示科技解锁点", false, "在地图上显示石器科技与铁器科技的位置");
+            _cfgTeleporters = config.Bind("显示设置", "显示传送门", false, "在地图上显示已建造的传送门，双向传送门会用连线标出两端");
             _cfgMapEnemies = config.Bind("显示设置", "显示怪物位置", false, "");
             _cfgClassStats = config.Bind("显示设置", "职业统计", false, "");
             _cfgCoins = config.Bind("显示设置", "金币数量统计", false, "");
@@ -185,6 +187,7 @@ namespace BetterKingdom
             LinkPurseTreasury = _cfgPurseLink.Value;
             ShowChests = _cfgChests.Value;
             ShowTechPoints = _cfgTechPoints.Value;
+            ShowTeleporters = _cfgTeleporters.Value;
             ShowMap = _cfgMap.Value;
             ShowMapEnemies = _cfgMapEnemies.Value;
             ShowClassStats = _cfgClassStats.Value;
@@ -216,6 +219,7 @@ namespace BetterKingdom
             _cfgPurseLink.Value = LinkPurseTreasury;
             _cfgChests.Value = ShowChests;
             _cfgTechPoints.Value = ShowTechPoints;
+            _cfgTeleporters.Value = ShowTeleporters;
             _cfgMap.Value = ShowMap;
             _cfgMapEnemies.Value = ShowMapEnemies;
             _cfgClassStats.Value = ShowClassStats;
@@ -556,8 +560,8 @@ namespace BetterKingdom
                         binding.Label, binding.Desc, gameFont, i + 1);
                 }
 
-                // ---- 显示设置页内容：可滚动视图 + 十四个开关行 + 右侧滚动条 ----
-                float contentHeight = 28f + 14 * ToggleRowHeight + 13 * ToggleRowGap;
+                // ---- 显示设置页内容：可滚动视图 + 十五个开关行 + 右侧滚动条 ----
+                float contentHeight = 28f + 15 * ToggleRowHeight + 14 * ToggleRowGap;
                 _scrollRect = CreateScrollContent(_page1.transform, contentHeight, out RectTransform contentRt);
                 // 解释文字直接读配置项描述（ConfigEntry.Description.Description），描述只写在 InitConfig 的 Bind 语句里
                 BuildToggleRow(contentRt, srcButton, "地图显示", ConfigDesc(_cfgMap), 0, gameFont,
@@ -580,17 +584,19 @@ namespace BetterKingdom
                     () => ShowChests, v => ShowChests = v, 28f));
                 _mapSubRows.Add(BuildToggleRow(contentRt, srcButton, "显示科技解锁点", ConfigDesc(_cfgTechPoints), 7, gameFont,
                     () => ShowTechPoints, v => ShowTechPoints = v, 28f));
-                _mapSubRows.Add(BuildToggleRow(contentRt, srcButton, "显示怪物位置", ConfigDesc(_cfgMapEnemies), 8, gameFont,
+                _mapSubRows.Add(BuildToggleRow(contentRt, srcButton, "显示传送门", ConfigDesc(_cfgTeleporters), 8, gameFont,
+                    () => ShowTeleporters, v => ShowTeleporters = v, 28f));
+                _mapSubRows.Add(BuildToggleRow(contentRt, srcButton, "显示怪物位置", ConfigDesc(_cfgMapEnemies), 9, gameFont,
                     () => ShowMapEnemies, v => ShowMapEnemies = v, 28f));
-                BuildToggleRow(contentRt, srcButton, "职业统计", ConfigDesc(_cfgClassStats), 9, gameFont,
+                BuildToggleRow(contentRt, srcButton, "职业统计", ConfigDesc(_cfgClassStats), 10, gameFont,
                     () => ShowClassStats, v => ShowClassStats = v);
-                BuildToggleRow(contentRt, srcButton, "金币数量统计", ConfigDesc(_cfgCoins), 10, gameFont,
+                BuildToggleRow(contentRt, srcButton, "金币数量统计", ConfigDesc(_cfgCoins), 11, gameFont,
                     () => ShowCoins, v => ShowCoins = v);
-                BuildToggleRow(contentRt, srcButton, "显示时间与季节", ConfigDesc(_cfgTimeSeason), 11, gameFont,
+                BuildToggleRow(contentRt, srcButton, "显示时间与季节", ConfigDesc(_cfgTimeSeason), 12, gameFont,
                     () => ShowTimeSeason, v => ShowTimeSeason = v);
-                BuildToggleRow(contentRt, srcButton, "显示怪物血条", ConfigDesc(_cfgGreedHealth), 12, gameFont,
+                BuildToggleRow(contentRt, srcButton, "显示怪物血条", ConfigDesc(_cfgGreedHealth), 13, gameFont,
                     () => ShowGreedHealth, v => ShowGreedHealth = v);
-                BuildToggleRow(contentRt, srcButton, "显示作物生长进度条", ConfigDesc(_cfgCropProgress), 13, gameFont,
+                BuildToggleRow(contentRt, srcButton, "显示作物生长进度条", ConfigDesc(_cfgCropProgress), 14, gameFont,
                     () => ShowCropProgress, v => ShowCropProgress = v);
                 _displayToggleCount = _toggles.Count;   // 显示页开关构建完毕，之后进入功能页
 
@@ -1355,7 +1361,7 @@ namespace BetterKingdom
             if (_pageIndex == 0)
             {
                 ShowAllDefenses = ShowOnlyBuiltDefenses = ShowAllCamps = ShowStatues = ShowMountSpawns
-                    = ShowGreedHealth = ShowCropProgress = ShowChests = ShowTechPoints
+                    = ShowGreedHealth = ShowCropProgress = ShowChests = ShowTechPoints = ShowTeleporters
                     = ShowMap = ShowMapEnemies = ShowClassStats = ShowCoins = ShowTimeSeason = false;
                 for (int i = 0; i < _displayToggleCount && i < _toggles.Count; i++)
                     if (_toggles[i].Fill != null) _toggles[i].Fill.color = ToggleOffColor;
