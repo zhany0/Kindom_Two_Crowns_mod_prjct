@@ -39,6 +39,7 @@ namespace BetterKingdom
         private static readonly Dictionary<int, int> _savedGuardDepth = new();
         private static readonly Dictionary<int, int> _savedKnightRank = new();
         private bool _lastDisableWallQueue;
+        private static bool _portalCheckRequested;   // 下一帧执行一次传送门工人检查
 
         /// <summary>当前实例（供 Harmony 补丁在传送门摧毁时立即触发检查）。</summary>
         public static FeatureBehaviour Instance { get; private set; }
@@ -84,29 +85,22 @@ namespace BetterKingdom
                 FixWallDefensePositions();
             }
 
-            if (now >= _nextPortalCheck)
+            if (_portalCheckRequested || now >= _nextPortalCheck)
             {
+                _portalCheckRequested = false;
                 _nextPortalCheck = now + HeavyInterval;
                 EnforcePortalWorkerLimit();
             }
         }
 
-        /// <summary>请求立即执行一次传送门工人检查（传送门摧毁或游戏重新分配工人时调用）。</summary>
+        /// <summary>
+        /// 请求执行一次传送门工人检查（传送门摧毁或游戏重新分配工人时调用）。
+        /// 只置标志、下一帧 Update 里执行：若在 DistributeWorkers 的 Postfix 里直接改派，
+        /// 会打断游戏正在进行的工人分配，影响投石车等岗位的人手。
+        /// </summary>
         public static void RequestPortalWorkerCheck()
         {
-            if (Instance != null)
-            {
-                Instance._nextPortalCheck = 0f;
-                return;
-            }
-            // 组件尚未创建时（例如读档早期）直接执行一次
-            try
-            {
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Kingdom kingdom = managers != null ? managers.kingdom : null;
-                if (kingdom != null) EnforcePortalWorkerLimit(kingdom);
-            }
-            catch { }
+            _portalCheckRequested = true;
         }
 
         private void RefreshCaches()
@@ -646,7 +640,7 @@ namespace BetterKingdom
             return false;
         }
 
-        /// <summary>把该侧工人保留 2 名，其余改派到洞窟一侧并让其重新寻找工作。</summary>
+        /// <summary>把该侧工人保留 2 名，其余空闲者改派洞窟一侧（有工作的工人不动，下一轮空闲时再改派）。</summary>
         private static void CapWorkersOnSide(Kingdom kingdom, Side portalSide, Side caveSide)
         {
             try
@@ -671,10 +665,12 @@ namespace BetterKingdom
 
                     if (kept < PortalSideWorkerLimit) { kept++; continue; }
 
-                    // 先中断当前工作与排队工作，再切换目标侧，确保工人不会再回到传送门一侧施工
-                    try { worker.SetCurrentWork(null); } catch { }
-                    try { worker._queuedWork = null; } catch { }
-                    try { worker.ResetWorkState(false); } catch { }
+                    // 只改派空闲工人：正在施工、推油桶（投石车装弹）等有工作的工人绝不打断，
+                    // 否则会抢走投石车操作员，或因反复清空工作让工人永远走不到新一侧
+                    bool busy;
+                    try { busy = worker._currentWork != null || worker._queuedWork != null; } catch { busy = true; }
+                    if (busy) continue;
+
                     try { worker.SetWorkerSide(caveSide); } catch { }
                     try { worker._targetSide = caveSide; } catch { }
                 }

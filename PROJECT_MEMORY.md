@@ -94,6 +94,8 @@
    - “季节日改为早上更新”仍只在显示层做偏移：`currentTime < dayStart≈5` 时把日序号减 1，再重新取季节（保证季节名与天数一致）。
 4. **传送门**：`PayableTeleporter.linkedTo` 是普通/双向的唯一可靠判据；`World.teleporters` 才是枚举入口，不要全场景 `FindObjectsByType`。
 5. **传送门摧毁后工人改派**：每侧保留 2 名工人，其余改派洞窟侧；必须用无状态周期性检测，不能依赖摧毁事件（旧存档中传送门可能已提前摧毁）。
+   **只改派空闲工人**（`_currentWork == null && _queuedWork == null`），正在施工/推油桶（投石车装弹）的工人绝不打断；不要调用 `SetCurrentWork(null)` / `ResetWorkState(false)`（会抢走投石车操作员、反复清空工作导致工人永远走不到新一侧）。
+   补丁（`DistributeWorkers` / `Portal.SetDestroyed` Postfix）只置标志，下一帧 `Update` 再执行改派，避免在游戏分配工人的调用栈内重入。
 6. **守墙排队机制**：`Kingdom.DistributeFreeArchers` 按顺序给同侧守墙弓箭手分配递增的 `Archer._guardDepth`（排队序号）；
    `Archer.GetWallTargetPos` 站位 = 墙位 ∓（最小间距 `_minDistanceFromWall`1.75 + 深度×`_unitSpacingAtWall`0.11 + `_guardRandomOffset`0.25），
    `Side.Left=-1 / Side.Right=1`（正负号即方向）。深度越大离墙越远，超出 `shootRange`（默认 6.5）后无法攻击墙外怪物。
