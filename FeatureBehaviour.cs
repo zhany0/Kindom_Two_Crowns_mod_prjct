@@ -18,6 +18,7 @@ namespace BetterKingdom
         private const float CacheInterval = 0.25f;   // 玩家/城堡/国库缓存刷新间隔
         private const float HeavyInterval = 2f;      // 墙体修正与传送门工人检查间隔
         private const float WallQueueClampInterval = 0.25f;  // 禁用排队时复钳间隔（游戏可能在分配补丁之外重写排队值）
+        private const float AssaultCheckInterval = 0.2f;    // 夜间墙外进攻怪物检测间隔
         private const int PurseMaxCoins = 38;        // 钱袋容量上限（钻石占 3 金币位，有效金币上限 = 38 - 3×钻石数）
         private const float PayHoldThreshold = 0.4f; // 长按判定阈值（秒），短点击不触发取款
         private const int PortalSideWorkerLimit = 2; // 传送门被摧毁后该侧保留的工人数
@@ -40,6 +41,17 @@ namespace BetterKingdom
         private static readonly Dictionary<int, int> _savedKnightRank = new();
         private bool _lastDisableWallQueue;
         private static bool _portalCheckRequested;   // 下一帧执行一次传送门工人检查
+        private static float _nextAssaultCheck;       // 下一次夜间进攻怪物检测时刻
+        private static bool _attackOnLeft, _attackOnRight;   // 夜晚该侧城墙外是否有进攻中的怪物
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _assaultEnemyBuffer;
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _assaultWorkerBuffer;
+        // 夜间避险时被取消的墙外工作：威胁解除后还给原工人，避免工人整夜闲置（游戏夜间不会重新分配工作）
+        private struct CancelledJob { public Worker Worker; public Workable Job; public Side Side; }
+        private static readonly List<CancelledJob> _cancelledJobs = new List<CancelledJob>();
+        // 攻门（付费冲锋）小队优先级：PayableBorder.Pay 遍历骑士时只放行选中的那支小队
+        private static int _chargeBestId = -1;          // 选中小队的实例 ID
+        private static bool _chargePickActive;          // 处于 PayableBorder.Pay 执行期间
+        private static bool _chargePicking;             // 正在计算最佳小队（绕过 CanCharge 过滤）
 
         /// <summary>当前实例（供 Harmony 补丁在传送门摧毁时立即触发检查）。</summary>
         public static FeatureBehaviour Instance { get; private set; }
@@ -62,6 +74,14 @@ namespace BetterKingdom
             SyncWallQueueSwitch();
 
             float now = Time.unscaledTime;
+
+            // 夜晚墙外有进攻怪物时，工人停止接活/撤销未开始的墙外工作
+            if (now >= _nextAssaultCheck)
+            {
+                _nextAssaultCheck = now + AssaultCheckInterval;
+                RefreshSideAssault();
+            }
+
             if (now >= _nextCacheRefresh)
             {
                 _nextCacheRefresh = now + CacheInterval;
@@ -165,8 +185,12 @@ namespace BetterKingdom
         {
             if (!ModWindowBehaviour.LinkPurseTreasury) return;
             Castle castle = _cachedCastle;
-            if (castle == null) return;   // 尚无城堡（国库）时不做任何转移
+            if (castle == null) return;   // 尚无城堡时不做任何转移
+            // 国库未解锁（还没有银行家）时没有真实账本：
+            // Castle._currentCoinCount 只是城堡金币堆的显示镜像（由 SendStashCount RPC 同步），不参与存档，
+            // 写进去金币会从钱袋消失却不落账，读出来还会凭空造币。因此没有银行家时整个联动不生效
             Banker banker = _cachedBanker;
+            if (banker == null) return;
             HandlePurseLink(_cachedPlayer, 0, castle, banker, now, ref _payHoldStartP1);
             HandlePurseLink(_cachedPlayer2, 1, castle, banker, now, ref _payHoldStartP2);
         }
@@ -678,6 +702,230 @@ namespace BetterKingdom
             catch { }
         }
 
+        // ==================== 夜晚工人避险（墙外有进攻怪物时不工作） ====================
+
+        /// <summary>
+        /// 夜晚检测两侧城墙外是否有"进攻状态"的怪物（存活、未撤退、未携带战利品逃走）。
+        /// 墙外有待执行工作时工人会优先去干活而不是退回城墙，速度又不及怪物，容易被攻击；
+        /// 这里在检测结果由"无"变"有"时撤销该侧工人已排队但未开始的墙外工作，
+        /// 新工作由 AssignJob 的 Prefix 拦截，避免每帧反复改动游戏状态。
+        /// </summary>
+        private void RefreshSideAssault()
+        {
+            bool wasLeft = _attackOnLeft, wasRight = _attackOnRight;
+            _attackOnLeft = _attackOnRight = false;
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Director director = managers != null ? managers.director : null;
+                if (director == null || director.IsDaytime) return;   // 白天不处理
+
+                Kingdom kingdom = managers.kingdom;
+                if (kingdom == null) return;
+                if (!TryGetX(kingdom.castle, out float castleX)) return;   // 无城堡时无法判断侧别
+
+                EnemyManager em = managers.enemies;
+                var all = em != null ? em.AllEnemies : null;
+                if (all == null || all.Count <= 0) return;
+
+                if (_assaultEnemyBuffer == null || _assaultEnemyBuffer.Length < all.Count)
+                    _assaultEnemyBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy>(Math.Max(all.Count, 16));
+                all.CopyTo(_assaultEnemyBuffer, 0);
+
+                for (int i = 0; i < all.Count; i++)
+                {
+                    Enemy e = _assaultEnemyBuffer[i];
+                    if (!IsAssaultingEnemy(e)) continue;
+                    if (!TryGetX(e, out float x)) continue;
+                    bool within;
+                    try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
+                    if (within) continue;   // 城墙内的怪物不算威胁
+                    if (x < castleX) _attackOnLeft = true; else _attackOnRight = true;
+                }
+            }
+            catch { }
+
+            if (_attackOnLeft && !wasLeft) CancelOutsideNightWork(Side.Left);
+            if (_attackOnRight && !wasRight) CancelOutsideNightWork(Side.Right);
+            RestoreCancelledJobs();
+        }
+
+        /// <summary>
+        /// 把之前为避险取消的墙外工作还回去：该侧威胁解除（或天亮了）时重新给原工人排上。
+        /// 游戏在夜间不会主动分配新工作，若不还回去，工人会一直闲置到第二天才被重新派活。
+        /// </summary>
+        private static void RestoreCancelledJobs()
+        {
+            if (_cancelledJobs.Count == 0) return;
+            Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+            Kingdom kingdom = managers != null ? managers.kingdom : null;
+            if (kingdom == null) return;
+
+            for (int i = _cancelledJobs.Count - 1; i >= 0; i--)
+            {
+                CancelledJob c = _cancelledJobs[i];
+                if (IsSideUnderAttack(c.Side)) continue;   // 该侧仍有威胁，保持取消
+
+                _cancelledJobs.RemoveAt(i);
+                try
+                {
+                    if (c.Worker == null || c.Job == null) continue;
+                    if (!TryGetX(c.Job, out float x)) continue;
+                    bool within;
+                    try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
+                    if (within) continue;   // 工作已经被改到墙内或失效，不再恢复
+                    if (c.Worker._queuedWork != null || c.Worker._currentWork != null) continue;   // 工人已有活干
+                    if (!c.Job.JobAvailable()) continue;   // 工作位已被别人占了或已完成
+                    c.Worker.AssignJob(c.Job);
+                }
+                catch { }
+            }
+        }
+
+        // ==================== 攻门（付费冲锋）小队优先级 ====================
+
+        /// <summary>
+        /// 付费攻门时挑选出动小队：先比人数（满员优先），人数相同优先高级骑士，再比距离（更近优先）。
+        /// 原版在 Kingdom.Knights 哈希集上遍历、只按弓箭手人数取最大值，人数相同则"后遍历者"胜出，
+        /// 顺序随机且不看骑士等级。
+        /// </summary>
+        public static void PrepareChargePick(PayableBorder border)
+        {
+            _chargeBestId = -1;
+            _chargePickActive = true;
+            _chargePicking = true;
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null || border == null) return;
+
+                var knights = kingdom.Knights;
+                if (knights == null || knights.Count <= 0) return;
+
+                float borderX;
+                if (!TryGetX(border, out borderX)) return;
+                float range = border.knightRange;
+
+                var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight>(knights.Count);
+                knights.CopyTo(arr, 0);
+
+                int bestCount = -1;
+                bool bestPromoted = false;
+                float bestDist = float.MaxValue;
+
+                for (int i = 0; i < arr.Length; i++)
+                {
+                    Knight k = arr[i];
+                    if (k == null) continue;
+                    if (!k.CanCharge()) continue;   // 状态/队形/弓箭手/传送门条件
+                    if (!TryGetX(k, out float kx)) continue;
+                    float dist = Mathf.Abs(kx - borderX);
+                    if (dist > range) continue;
+
+                    int count;
+                    try { count = k.numArchers; } catch { count = 0; }
+                    if (count <= 0) continue;
+                    bool promoted;
+                    try { promoted = k._wasPromoted; } catch { promoted = false; }
+
+                    bool better;
+                    if (count != bestCount) better = count > bestCount;
+                    else if (promoted != bestPromoted) better = promoted;
+                    else better = dist < bestDist;
+                    if (!better) continue;
+
+                    bestCount = count;
+                    bestPromoted = promoted;
+                    bestDist = dist;
+                    _chargeBestId = k.GetInstanceID();
+                }
+            }
+            catch { }
+            finally { _chargePicking = false; }
+        }
+
+        /// <summary>PayableBorder.Pay 结束后清除攻门选人上下文。</summary>
+        public static void FinishChargePick()
+        {
+            _chargePickActive = false;
+            _chargeBestId = -1;
+        }
+
+        /// <summary>PayableBorder.Pay 遍历骑士期间，只让选中的小队通过 CanCharge。</summary>
+        public static bool AllowChargeCandidate(Knight k)
+        {
+            if (!_chargePickActive || _chargePicking) return true;
+            if (_chargeBestId < 0) return true;   // 没有可冲锋小队时保持原版行为
+            try { return k.GetInstanceID() == _chargeBestId; } catch { }
+            return true;
+        }
+
+        /// <summary>怪物是否处于进攻状态：存活、未决定撤退、未携带战利品离开。</summary>
+        private static bool IsAssaultingEnemy(Enemy e)
+        {
+            try
+            {
+                if (e == null || e.IsDespawning) return false;
+                if (e.shouldRetreat) return false;   // 已决定撤回传送门
+                Damageable d = e.damageable;
+                if (d != null && d.isDead) return false;
+                return e.loot == null;   // 捡到金币/战利品逃走的怪物不再算进攻
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>夜晚该侧城墙外是否有进攻中的怪物（供 AssignJob 拦截新工作）。</summary>
+        public static bool IsSideUnderAttack(Side side)
+        {
+            if (side == Side.Left) return _attackOnLeft;
+            if (side == Side.Right) return _attackOnRight;
+            return false;
+        }
+
+        /// <summary>撤销该侧工人已排队但尚未开始的墙外工作（墙内工作与守城岗位不动）。</summary>
+        private static void CancelOutsideNightWork(Side side)
+        {
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return;
+                var workers = kingdom.Workers;
+                if (workers == null || workers.Count <= 0) return;
+
+                if (_assaultWorkerBuffer == null || _assaultWorkerBuffer.Length < workers.Count)
+                    _assaultWorkerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(workers.Count, 16));
+                workers.CopyTo(_assaultWorkerBuffer, 0);
+
+                int count = workers.Count;
+                for (int i = 0; i < count; i++)
+                {
+                    Worker w = _assaultWorkerBuffer[i];
+                    if (w == null) continue;
+                    Side targetSide;
+                    try { targetSide = w._targetSide; } catch { continue; }
+                    if (targetSide != side) continue;
+                    Workable queued;
+                    try { queued = w._queuedWork; } catch { continue; }
+                    if (queued == null) continue;
+                    if (!TryGetX(queued, out float x)) continue;
+                    bool within;
+                    try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
+                    if (within) continue;
+                    // 必须走游戏自己的取消流程：CancelWork 会释放该工作位的占用并回调 OnJobCancel。
+                    // 直接置空 _queuedWork 会留下没人释放的工作位，之后同类工作不再被分配，
+                    // 表现为"本侧没怪了也只剩新任务能触发工人出门"
+                    try { queued.CancelWork(w); } catch { }
+                    try { w._queuedWork = null; } catch { }
+                    // 记下来，威胁解除后还给原工人（游戏夜间不会再分配工作）
+                    if (_cancelledJobs.Count < 64) _cancelledJobs.Add(new CancelledJob { Worker = w, Job = queued, Side = side });
+                }
+            }
+            catch { }
+        }
+
         /// <summary>
         /// 取洞窟所在侧：洞窟本身是 Cliff 类型的 Portal，优先遍历 AllPortals 取坐标；
         /// 找不到时再低频兜底搜索场景中的 BombablePortal（洞窟入口组件）。
@@ -846,6 +1094,64 @@ namespace BetterKingdom
         public static void Postfix(Kingdom __instance)
         {
             FeatureBehaviour.DisableWallQueueing(__instance);
+        }
+    }
+
+    /// <summary>
+    /// 夜晚该侧城墙外有进攻怪物时，拒绝接受新的墙外工作（墙内工作与守城岗位照常）。
+    /// 工人速度不及怪物，被派去远处墙外工作会被追上攻击。
+    /// </summary>
+    [HarmonyPatch(typeof(Worker), nameof(Worker.AssignJob))]
+    public static class WorkerNightOutsideWorkPatch
+    {
+        public static bool Prefix(Worker __instance, Workable job)
+        {
+            try
+            {
+                if (__instance == null || job == null) return true;
+                if (!FeatureBehaviour.IsSideUnderAttack(__instance._targetSide)) return true;
+
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return true;
+
+                float x = job.transform.position.x;
+                return kingdom.IsWithinWalls(x);   // 墙内工作允许，墙外工作拒绝
+            }
+            catch { }
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// 付费攻门前先挑出本次出动的骑士小队，供 CanCharge 过滤使用。
+    /// 原版按哈希集遍历、只看弓箭手人数，顺序随机且不区分骑士等级。
+    /// </summary>
+    [HarmonyPatch(typeof(PayableBorder), nameof(PayableBorder.Pay))]
+    public static class ChargeSquadPriorityPayPatch
+    {
+        public static void Prefix(PayableBorder __instance)
+        {
+            FeatureBehaviour.PrepareChargePick(__instance);
+        }
+
+        public static void Postfix()
+        {
+            FeatureBehaviour.FinishChargePick();
+        }
+    }
+
+    /// <summary>
+    /// PayableBorder.Pay 遍历骑士期间只放行选中的小队，
+    /// 从而让原版循环选中"满员 → 高级骑士 → 更近"的那一支。
+    /// </summary>
+    [HarmonyPatch(typeof(Knight), nameof(Knight.CanCharge))]
+    public static class ChargeSquadPriorityCanChargePatch
+    {
+        public static void Postfix(Knight __instance, ref bool __result)
+        {
+            if (!__result || __instance == null) return;
+            if (!FeatureBehaviour.AllowChargeCandidate(__instance)) __result = false;
         }
     }
 }

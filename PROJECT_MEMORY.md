@@ -104,6 +104,18 @@
    骑士是另一套机制：`Kingdom.RankKnights` 给同侧骑士依次写 `Knight.rank = 1..N`，`Knight.GetTargetPos` 站位 = 墙位 ∓ `rank`×`_distanceFromWall`（rank 从 1 起算，无单独最小间距），同一开关下把 `rank > 1` 的骑士归 1；骑士跟随士兵随骑士整体前移，无需单独处理。
    `Knight.ShouldGoToWall` 会比较当前位置与 `GetTargetPos()`，因此写回 `rank` 后骑士会自行重新走位，无需调用 `RankKnights()`。
    `Pikeman` 有独立的三格墙位（`Pikeman.Assign(Wall, readiness)`，站位含 `3-readiness`），不是长队；`Berserker` 只有固定 `distanceFromWall`，无排队序号。
+7. **夜晚工人避险**：夜间（`Director.IsDaytime == false`）若某侧城墙外存在"进攻状态"怪物，该侧工人不接受新的墙外工作。
+   进攻判据：`!Enemy.IsDespawning && !Enemy.shouldRetreat && !damageable.isDead && Enemy.loot == null`（`loot` 非空＝已捡到金币/战利品逃走）。
+   `Enemy` 没有侧别字段，用世界坐标 x 与 `kingdom.castle` 的 x 比较分侧，再用 `Kingdom.IsWithinWalls(x)` 判断是否在城墙外。
+   拦截点：`Worker.AssignJob(Workable)` Prefix 返回 false（只拦墙外工作，墙内工作与守城岗位照常）；已在排队但未开始的墙外工作，在检测到该侧威胁的瞬间用 `Workable.CancelWork(Worker)`（继承自 `Doable<Worker>`）取消，再置空 `Worker._queuedWork`。**不能只把 `_queuedWork` 置空**：工作位的占用不会被释放，之后同类工作不再分配，表现为"没怪了也要等新任务才出门"。检测结果缓存 0.2s。
+   注意：游戏**夜间不会派新活**（`Worker.Behaviour` 仅在 `Director.IsDaytime` 时调用 `Kingdom.ReassignWork`），夜间只延续黄昏前排好的工作。所以取消排队工作必须记录（工人,工作,侧）并在该侧威胁解除时用 `Worker.AssignJob` 还回去（`RestoreCancelledJobs`），否则工人整夜闲置到第二天。
+   不要整体拦 `Worker.IsAvailable()`，否则墙内工作也会被拒绝，且会影响游戏的人数统计。
+8. **钱袋与国库共通**：真实国库账本是 `Banker._stashedCoins`（存档走 `BankerData.stashedCoins`）；
+   `Castle._currentCoinCount` 只是城堡金币堆的显示镜像（`SendStashCount`/`RecvStashCount` RPC 同步，`Castle.stash` + `stashHeight` 按数量画高度），**不参与存档**。
+   因此国库未解锁（场景里没有 `Banker`）时整个联动必须关闭，否则溢出金币写进显示字段会丢失、取款还会凭空造币。判定入口：`_cachedBanker == null` 直接 return。
+9. **付费攻门小队优先级**：入口是 `PayableBorder.Pay()`（玩家付费后由 `Payable.PerformPay()` 虚调用），原版在 `Kingdom.Knights` 哈希集上遍历，只按 `Knight.numArchers` 取最大，人数相同则"后遍历者"胜出（顺序随机），不看 `_wasPromoted`。
+   模组做法：`PayableBorder.Pay` Prefix 里按 `CanCharge()` + `|kx-border.x| <= knightRange` 筛出候选，排序键为 人数 > `_wasPromoted` > 距离更近，记下实例 ID；同期间 `Knight.CanCharge` Postfix 只放行该 ID，使原版循环必然选中它；Postfix 清理上下文。计算候选时用 `_chargePicking` 标志绕过 `CanCharge` 自身过滤，避免递归。
+   小队人数 = `Knight._archers` 的 `Count`（`numArchers`），上限 `_maxArchers`（prefab 值 4）；`_numAdditionalChargeFollowers` 是冲锋时招募狂战士的参数，不是人数依据。
 
 ## 5. 未知字段/方法怎么查（逆向工具链）
 

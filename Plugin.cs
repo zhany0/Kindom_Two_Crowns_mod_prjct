@@ -43,6 +43,9 @@ namespace BetterKingdom
             harmony.PatchAll(typeof(WallQueueArcherDistributionPatch));
             harmony.PatchAll(typeof(WallQueueFreeArcherDistributionPatch));
             harmony.PatchAll(typeof(WallQueueKnightRankPatch));
+            harmony.PatchAll(typeof(WorkerNightOutsideWorkPatch));
+            harmony.PatchAll(typeof(ChargeSquadPriorityPayPatch));
+            harmony.PatchAll(typeof(ChargeSquadPriorityCanChargePatch));
         }
     }
 
