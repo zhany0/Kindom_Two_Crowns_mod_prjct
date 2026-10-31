@@ -24,6 +24,9 @@ namespace BetterKingdom
         private const float LightRefreshInterval = 0.02f;
         private const float MediumRefreshInterval = 0.25f;
         private const float HeavyRefreshInterval = 2f;
+        private const float OilScanInterval = 4f;    // 火油桶统计间隔（全场景扫描，与 2 秒重刷新错峰）
+        private const float CaveScanInterval = 10f;  // 洞窟位置扫描间隔（洞窟是静态对象，只在炸毁时变化）
+        private const float FarmScanInterval = 2f;   // 农田引用重建间隔（原先 0.25 秒一次全场景扫描过重）
         private const float DotRadius = 7f;
         private const int EnemySideHysteresis = 2;         // 侧别切换滞回（多数侧需多出该数量才切换）
         private const int LabelFontSize = 18;
@@ -62,13 +65,9 @@ namespace BetterKingdom
         private Texture2D _texBarBg, _texHpFill, _texCropFill;
         private GUIStyle _styleBarBg, _styleHpFill, _styleCropFill;
         private struct WorldBar { public Vector3 Pos; public float Frac; }
-        // 作物进度条动画状态：显示值按估算速率连续匀速推进，与整数进度点的到达节奏解耦
-        private struct CropAnim { public float Shown; public float Rate; public int LastCur; public float LastTime; }
         private readonly List<WorldBar> _hpBars = new();       // 怪物血条（轻刷新重建）
         private readonly List<WorldBar> _cropBars = new();     // 作物进度条（轻刷新重建）
         private readonly List<Farmland> _farmlands = new();    // 农田引用缓存（中频重建，低频读进度）
-        private readonly Dictionary<Farmland, CropAnim> _cropSmooth = new();  // 每块农田的进度条动画状态（键随引用缓存一并清理）
-        private float _lastCropTick;     // 上次作物进度轻刷新的 Time.time（推进间隔基准，替代与帧率挂钩的 deltaTime）
         private Camera _cachedCam;       // 世界转屏幕用的相机缓存（中频重建；Camera.main 在本游戏为 null，需遍历兜底）
         // 世界悬浮条尺寸与头顶偏移（屏幕像素/世界单位）
         private const float HpBarWidth = 80f, HpBarHeight = 10f;      // 怪物血条
@@ -91,6 +90,10 @@ namespace BetterKingdom
         private bool _boundsReady;
         private bool _hasData;
         private float _nextLightRefresh, _nextMediumRefresh, _nextHeavyRefresh;
+        // 全场景扫描（FindObjectsByType）彼此错峰：集中在一帧执行会形成每 2 秒一次的帧尖峰
+        private float _nextOilScan, _nextCaveScan, _nextFarmScan;
+        // 可选标记分帧轮询：每次重刷新只扫一类（难民营/雕像/坐骑/宝箱/科技），每类约 10 秒刷新一次
+        private int _optionalScanSlot;
 
         //   每帧缓存的可见性状态（供 OnGUI 复用，避免每个 GUI 事件重复 IL2CPP 互操作查询）  
         private bool _overlayVisible;
@@ -196,6 +199,10 @@ namespace BetterKingdom
             _styleLabel = new GUIStyle { normal = { textColor = Color.white }, fontSize = LabelFontSize, alignment = TextAnchor.UpperCenter };
             _styleInfo = new GUIStyle { normal = { textColor = Color.white }, fontSize = InfoFontSize, alignment = TextAnchor.UpperLeft };
             _styleJob = new GUIStyle { normal = { textColor = Color.white }, fontSize = JobFontSize, alignment = TextAnchor.UpperLeft };
+            // 错峰初始化：首帧先做洞窟扫描与重刷新，其余全场景扫描推迟到后续帧
+            _nextCaveScan = Time.unscaledTime;
+            _nextOilScan = Time.unscaledTime + 1f;
+            _nextFarmScan = Time.unscaledTime + 1f;
         }
 
         private static Texture2D MakeSolidTexture(Color color)
@@ -223,6 +230,23 @@ namespace BetterKingdom
             _wantCursor = !_isMenuOpen || ModWindowBehaviour.IsOpen;
 
             float now = Time.unscaledTime;
+
+            // 全场景扫描彼此错峰：FindObjectsByType 会遍历整个场景，集中执行会形成每 2 秒一次的帧尖峰
+            if (now >= _nextCaveScan)
+            {
+                _nextCaveScan = now + CaveScanInterval;
+                RefreshCavePositions();
+            }
+            if (now >= _nextOilScan)
+            {
+                _nextOilScan = now + OilScanInterval;
+                RefreshOilBarrels();
+            }
+            if (now >= _nextFarmScan)
+            {
+                _nextFarmScan = now + FarmScanInterval;
+                RefreshFarmlandRefs();
+            }
 
             if (now >= _nextLightRefresh)
             {
@@ -320,8 +344,7 @@ namespace BetterKingdom
                 Player player = null;
                 try { player = kingdom.playerOne ?? kingdom.GetPlayer(0); } catch { }
 
-                // 农田引用缓存（作物生长进度条用：中频重建引用，轻频读进度）
-                RefreshFarmlandRefs();
+                // 农田引用缓存已独立成 2 秒定时任务（见 Update 的 FarmScanInterval），中频这里不再重建
 
                 // 相机缓存（世界转屏幕用）：本游戏 Camera.main 为 null，需遍历所有相机找启用的
                 RefreshCameraRef();
@@ -647,11 +670,9 @@ namespace BetterKingdom
                 // 城堡位置（基本静态，重刷新时更新即可）
                 _hasCastle = TryGetX(kingdom.castle, out _castleX);
 
-                // 火油桶统计（按左右侧）
-                RefreshOilBarrels();
+                // 火油桶统计已独立成 4 秒定时任务（见 Update 的 OilScanInterval），不再放进重刷新
 
                 _portalX.Clear();
-                _caveX.Clear();
                 _wallX.Clear();
                 _teleporterX.Clear();
                 _teleLinks.Clear();
@@ -707,18 +728,19 @@ namespace BetterKingdom
                 }
                 catch { }
 
+                // 洞窟坐标由 RefreshCavePositions 单独扫描（10 秒一次），这里只复用缓存：
+                // 过滤与洞窟重合的怪物传送门；边界不可用时把洞窟坐标纳入地图范围
                 try
                 {
-                    var cliffs = UnityEngine.Object.FindObjectsByType<BombablePortal>(FindObjectsSortMode.None);
-                    foreach (BombablePortal cliff in cliffs)
+                    _portalX.RemoveAll(px => CaveOverlaps(px, _caveX));
+                    if (!boundsValid)
                     {
-                        if (TryGetX(cliff, out float x))
+                        for (int i = 0; i < _caveX.Count; i++)
                         {
-                            _caveX.Add(x);
-                            if (!boundsValid) { minX = Math.Min(minX, x); maxX = Math.Max(maxX, x); }
+                            minX = Math.Min(minX, _caveX[i]);
+                            maxX = Math.Max(maxX, _caveX[i]);
                         }
                     }
-                    _portalX.RemoveAll(px => CaveOverlaps(px, _caveX));
                 }
                 catch { }
 
@@ -751,17 +773,8 @@ namespace BetterKingdom
 
                 CollectWallAndTowerMarkers(kingdom, boundsValid, ref minX, ref maxX);
 
-                // 功能开关控制的额外标记：仅开关开启时收集（关闭时清空不绘制）
-                _campMarkers.Clear();
-                _statueMarkers.Clear();
-                _mountMarkers.Clear();
-                _chestMarkers.Clear();
-                _techMarkers.Clear();
-                if (ModWindowBehaviour.ShowAllCamps) CollectCampMarkers(kingdom);
-                if (ModWindowBehaviour.ShowStatues) CollectStatueMarkers();
-                if (ModWindowBehaviour.ShowMountSpawns) CollectMountMarkers();
-                if (ModWindowBehaviour.ShowChests) CollectChestMarkers();
-                if (ModWindowBehaviour.ShowTechPoints) CollectTechMarkers();
+                // 功能开关控制的额外标记：分帧轮询，每次重刷新只扫一类（开关关闭时立即清空）
+                ScanOptionalMarkers(kingdom);
                 if (ModWindowBehaviour.ShowTeleporters) CollectTeleporters(world);
 
                 _hasData = minX < maxX;
@@ -827,6 +840,73 @@ namespace BetterKingdom
         }
 
         /// <summary>
+        /// 刷新洞窟坐标（10 秒一次）：洞窟是静态关卡对象，只有被炸毁时集合才变化，
+        /// 没必要塞进 2 秒重刷新里做一次全场景扫描。已裁剪的地图边界不会因洞窟消失而回弹。
+        /// </summary>
+        private void RefreshCavePositions()
+        {
+            _caveX.Clear();
+            try
+            {
+                var cliffs = UnityEngine.Object.FindObjectsByType<BombablePortal>(FindObjectsSortMode.None);
+                for (int i = 0; i < cliffs.Length; i++)
+                {
+                    if (TryGetX(cliffs[i], out float x)) _caveX.Add(x);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 可选标记分帧轮询：难民营/雕像/坐骑/宝箱/科技解锁点各自需要一次全场景扫描，
+        /// 集中在一帧执行会形成明显卡顿；这里每次重刷新只处理一类（每类约 10 秒刷新一次）。
+        /// 关闭对应开关时立即清空，不受轮询节奏影响。
+        /// </summary>
+        private void ScanOptionalMarkers(Kingdom kingdom)
+        {
+            if (!ModWindowBehaviour.ShowAllCamps) _campMarkers.Clear();
+            if (!ModWindowBehaviour.ShowStatues) _statueMarkers.Clear();
+            if (!ModWindowBehaviour.ShowMountSpawns) _mountMarkers.Clear();
+            if (!ModWindowBehaviour.ShowChests) _chestMarkers.Clear();
+            if (!ModWindowBehaviour.ShowTechPoints) _techMarkers.Clear();
+
+            _optionalScanSlot++;
+            if (_optionalScanSlot >= 5) _optionalScanSlot = 0;
+            try
+            {
+                switch (_optionalScanSlot)
+                {
+                    case 0:
+                        if (!ModWindowBehaviour.ShowAllCamps) break;
+                        _campMarkers.Clear();
+                        CollectCampMarkers(kingdom);
+                        break;
+                    case 1:
+                        if (!ModWindowBehaviour.ShowStatues) break;
+                        _statueMarkers.Clear();
+                        CollectStatueMarkers();
+                        break;
+                    case 2:
+                        if (!ModWindowBehaviour.ShowMountSpawns) break;
+                        _mountMarkers.Clear();
+                        CollectMountMarkers();
+                        break;
+                    case 3:
+                        if (!ModWindowBehaviour.ShowChests) break;
+                        _chestMarkers.Clear();
+                        CollectChestMarkers();
+                        break;
+                    default:
+                        if (!ModWindowBehaviour.ShowTechPoints) break;
+                        _techMarkers.Clear();
+                        CollectTechMarkers();
+                        break;
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// 统计两侧火油桶：投石车已装填队列（Catapult.queuedOilBarrels）
         /// + 运送中未送达的桶（RollableOilBarrel 未 delivered），按 Catapult.side/RollableOilBarrel.side 分侧。
         /// </summary>
@@ -879,23 +959,13 @@ namespace BetterKingdom
         private void RefreshFarmlandRefs()
         {
             _farmlands.Clear();
-            if (!ModWindowBehaviour.ShowCropProgress) { _cropSmooth.Clear(); return; }
+            if (!ModWindowBehaviour.ShowCropProgress) return;
             try
             {
                 var lands = UnityEngine.Object.FindObjectsByType<Farmland>(FindObjectsSortMode.None);
                 if (lands == null) return;
                 for (int i = 0; i < lands.Length; i++)
                     if (lands[i] != null) _farmlands.Add(lands[i]);
-
-                // 剔除已失效农田的平滑状态（引用缓存重建后键可能已不存在）
-                if (_cropSmooth.Count > 0)
-                {
-                    List<Farmland> stale = null;
-                    foreach (var kv in _cropSmooth)
-                        if (!_farmlands.Contains(kv.Key)) (stale ??= new List<Farmland>()).Add(kv.Key);
-                    if (stale != null)
-                        foreach (Farmland k in stale) _cropSmooth.Remove(k);
-                }
             }
             catch { }
         }
@@ -962,13 +1032,6 @@ namespace BetterKingdom
             _cropBars.Clear();
             if (!ModWindowBehaviour.ShowCropProgress) return;
 
-            // 推进时长必须用轻刷新的真实间隔：本方法被限制在 50Hz 执行，
-            // 若直接用 Time.deltaTime（帧时间），帧率高于 50fps 时推进会按比例变慢
-            float now = Time.time;
-            float tickDt = now - _lastCropTick;
-            _lastCropTick = now;
-            if (tickDt < 0f || tickDt > 0.1f) tickDt = 0f;   // 首次调用或开关重开后的异常间隔不计
-
             for (int i = _farmlands.Count - 1; i >= 0; i--)
             {
                 Farmland f = _farmlands[i];
@@ -984,52 +1047,12 @@ namespace BetterKingdom
 
                     if (farmPoints <= 0) continue;
                     float frac = (float)cur / farmPoints;
-                    if (frac >= 1f) { _cropSmooth.Remove(f); continue; }   // 已成熟
+                    if (frac >= 1f) continue;   // 已成熟
                     // 没有农夫耕作过的田不显示（未耕作时进度点为 0 且未被标记耕作中）
-                    if (cur <= 0 && !isFarmed) { _cropSmooth.Remove(f); continue; }
+                    if (cur <= 0 && !isFarmed) continue;
 
-                    // 完全线性增长：显示值按实测速率连续匀速推进，不追随整数进度点的到达节奏。
-                    // 速率 = 最近进度跳变量 / 跳变间隔时间，新跳变只更新速率、不改写显示值，
-                    // 因此进度条斜率稳定、无停顿；进度回退（收获/清空）立即吸附。
-                    CropAnim anim;
-                    if (!_cropSmooth.TryGetValue(f, out anim))
-                    {
-                        anim = new CropAnim { Shown = frac, Rate = 0f, LastCur = cur, LastTime = now };
-                    }
-                    else if (cur != anim.LastCur)
-                    {
-                        if (cur < anim.LastCur)
-                        {
-                            // 收获/清空：立即吸附
-                            anim.Shown = frac;
-                            anim.Rate = 0f;
-                        }
-                        else
-                        {
-                            float dt = now - anim.LastTime;
-                            if (dt > 0.01f)
-                            {
-                                float instRate = ((float)(cur - anim.LastCur) / farmPoints) / dt;
-                                // 速率平滑：新观测占 35%，避免单次异常间隔导致斜率突变
-                                anim.Rate = anim.Rate <= 0f ? instRate : Mathf.Lerp(anim.Rate, instRate, 0.35f);
-                            }
-                        }
-                        anim.LastCur = cur;
-                        anim.LastTime = now;
-                    }
-                    // 匀速推进（用轻刷新真实间隔，与帧率无关）；仅做 [0,1] 夹取，不设中间硬上限，
-                    // 避免显示值顶到真实进度 frac 后产生停顿（分段线性）
-                    if (anim.Rate > 0f)
-                        anim.Shown = Mathf.Clamp(anim.Shown + anim.Rate * tickDt, 0f, 1f);
-                    // 校准：保持与真实进度贴合。落后时快速追上（消除累计误差），
-                    // 超前时极慢回吐（速率偏快时几乎无可见收缩）
-                    if (frac > anim.Shown)
-                        anim.Shown = Mathf.Lerp(anim.Shown, frac, tickDt * 0.9f);
-                    else if (frac < anim.Shown)
-                        anim.Shown = Mathf.Lerp(anim.Shown, frac, tickDt * 0.1f);
-                    _cropSmooth[f] = anim;
-
-                    _cropBars.Add(new WorldBar { Pos = f.transform.position + new Vector3(0f, CropBarWorldOffsetY, 0f), Frac = Mathf.Clamp01(anim.Shown) });
+                    // 阶梯更新：按游戏的真实进度点（整数）直接显示，不做平滑插值
+                    _cropBars.Add(new WorldBar { Pos = f.transform.position + new Vector3(0f, CropBarWorldOffsetY, 0f), Frac = Mathf.Clamp01(frac) });
                 }
                 catch { _farmlands.RemoveAt(i); }
             }

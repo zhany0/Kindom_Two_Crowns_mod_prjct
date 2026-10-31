@@ -312,17 +312,6 @@ namespace BetterKingdom
                     if (b.ActionId >= 0) break;
                 }
             }
-            // 临时诊断：记录解析结果（动作 id 与动作名），用于确认是否命中游戏的游戏内动作而非菜单导航动作
-            if (b.ActionId >= 0)
-            {
-                try
-                {
-                    var act = Rewired.ReInput.mapping.GetAction(b.ActionId);
-                    UnityEngine.Debug.Log("[BetterKingdom] 按键绑定 " + b.Id + " -> 动作id " + b.ActionId +
-                        " (" + (act != null ? act.name : "?") + ")" + (b.ResolvedByName ? " [按名匹配]" : " [键位兜底]"));
-                }
-                catch { }
-            }
         }
 
         /// <summary>该绑定是否被玩家改成过非默认键位（默认键位不需要写入 Rewired）。</summary>

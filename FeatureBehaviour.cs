@@ -18,10 +18,13 @@ namespace BetterKingdom
         private const float CacheInterval = 0.25f;   // 玩家/城堡/国库缓存刷新间隔
         private const float HeavyInterval = 2f;      // 墙体修正与传送门工人检查间隔
         private const float WallQueueClampInterval = 0.25f;  // 禁用排队时复钳间隔（游戏可能在分配补丁之外重写排队值）
-        private const float AssaultCheckInterval = 0.2f;    // 夜间墙外进攻怪物检测间隔
+        private const float AssaultCheckInterval = 0.2f;    // 墙外进攻怪物检测间隔
         private const int PurseMaxCoins = 38;        // 钱袋容量上限（钻石占 3 金币位，有效金币上限 = 38 - 3×钻石数）
         private const float PayHoldThreshold = 0.4f; // 长按判定阈值（秒），短点击不触发取款
         private const int PortalSideWorkerLimit = 2; // 传送门被摧毁后该侧保留的工人数
+        private const float SafeCheckInterval = 2f;     // 白天安全态兜底检查间隔
+        private const float SafeWorkDistance = 20f;     // 墙外工作固定安全距离：距该侧城墙外沿超过此值，该侧有怪物出击就撤回
+        private const float ForcedSafeCooldown = 15f;   // 强制安全转换的最小间隔（转换会重跑整套分配流程，不能高频触发）
 
         private Player _cachedPlayer;
         private Player _cachedPlayer2;
@@ -31,10 +34,13 @@ namespace BetterKingdom
         private float _payHoldStartP1 = -1f, _payHoldStartP2 = -1f;
         private float _nextCacheRefresh, _nextHeavyWork, _nextPortalCheck, _nextWallQueueClamp;
         private static float _nextCaveScan;  // 兜底场景搜索洞窟的节流时间
+        private static float _nextSafeCheck, _nextForcedSafe;  // 安全态兜底检查与强制转换的节流时间
+        private static int _cachedKingdomId = -1;             // 用于检测换岛（Kingdom 实例变化）
+        private static bool _wasNight;                        // 上一轮昼夜判定（用于捕捉入夜瞬间）
 
         // 城墙边界缓存（供弓箭手守墙bug修正使用）
         private struct WallBound { public float X; public float HalfW; }
-        private readonly List<WallBound> _wallBounds = new();
+        private static readonly List<WallBound> _wallBounds = new();
 
         // 禁用排队机制：记录钳制前的原始排队值（键为对象实例ID），关闭开关时按原值立即还原
         private static readonly Dictionary<int, int> _savedGuardDepth = new();
@@ -45,6 +51,12 @@ namespace BetterKingdom
         private static bool _attackOnLeft, _attackOnRight;   // 夜晚该侧城墙外是否有进攻中的怪物
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _assaultEnemyBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _assaultWorkerBuffer;
+        // 周期性遍历复用缓冲：修正流程每 2 秒执行一次，反复分配 IL2CPP 数组会造成 GC 尖峰与掉帧
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer> _archerBuffer;
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall> _wallBuffer;
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<GuardSlot> _guardSlotBuffer;
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight> _knightBuffer;
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _workerBuffer;
         // 夜间避险时被取消的墙外工作：威胁解除后还给原工人，避免工人整夜闲置（游戏夜间不会重新分配工作）
         private struct CancelledJob { public Worker Worker; public Workable Job; public Side Side; }
         private static readonly List<CancelledJob> _cancelledJobs = new List<CancelledJob>();
@@ -53,6 +65,8 @@ namespace BetterKingdom
         private static bool _chargePickActive;          // 处于 PayableBorder.Pay 执行期间
         private static bool _chargePicking;             // 正在计算最佳小队（绕过 CanCharge 过滤）
 
+        private static int _safeLastKingdomId = -1;     // 安全态兜底记录的 Kingdom 实例ID（换岛时重置节流）
+
         /// <summary>当前实例（供 Harmony 补丁在传送门摧毁时立即触发检查）。</summary>
         public static FeatureBehaviour Instance { get; private set; }
 
@@ -60,6 +74,9 @@ namespace BetterKingdom
         {
             Instance = this;
             _lastDisableWallQueue = ModWindowBehaviour.DisableWallQueue;
+            // 错峰执行重型任务：墙体修正与传送门检查同帧触发会形成约每 2 秒一次的帧尖峰
+            _nextHeavyWork = Time.unscaledTime + 0.7f;
+            _nextPortalCheck = Time.unscaledTime + 1.4f;
         }
 
         private void OnDestroy()
@@ -75,7 +92,8 @@ namespace BetterKingdom
 
             float now = Time.unscaledTime;
 
-            // 夜晚墙外有进攻怪物时，工人停止接活/撤销未开始的墙外工作
+            // 墙外有进攻怪物时，工人停止接活/撤销无法安全撤离的墙外工作（不区分昼夜：
+            // 传送门离城墙较远时游戏会在天黑前提前放怪）
             if (now >= _nextAssaultCheck)
             {
                 _nextAssaultCheck = now + AssaultCheckInterval;
@@ -86,6 +104,15 @@ namespace BetterKingdom
             {
                 _nextCacheRefresh = now + CacheInterval;
                 RefreshCaches();
+            }
+
+            // 白天安全态兜底：换岛后王国偶发停在“非安全”状态，工人缩回营地、弓箭手白天不打猎
+            // 夜间反之：进入非安全态，让弓箭手上墙驻守（见 EnsureNightUnsafe）
+            if (now >= _nextSafeCheck)
+            {
+                _nextSafeCheck = now + SafeCheckInterval;
+                EnsureDaytimeSafe();
+                EnsureNightUnsafe();
             }
 
             // 禁用排队时高频复钳：游戏会在夜袭等时机经其它分配路径重新写入排队深度，
@@ -123,6 +150,29 @@ namespace BetterKingdom
             _portalCheckRequested = true;
         }
 
+        /// <summary>
+        /// 检测换岛（Kingdom 实例变化）：旧岛的墙体缓存、已取消工作、安全态节流全部作废，
+        /// 立即重建墙体边界并重新评估安全态，避免拿旧岛数据判断新岛。
+        /// </summary>
+        private void TrackKingdomChange(Kingdom kingdom)
+        {
+            try
+            {
+                int kid = kingdom.GetInstanceID();
+                if (kid == _cachedKingdomId) return;
+                _cachedKingdomId = kid;
+                _wallBounds.Clear();
+                _cancelledJobs.Clear();
+                float now = Time.unscaledTime;
+                _nextHeavyWork = now + 0.7f;     // 换岛后同样错峰，避免两个重型任务同帧执行
+                _nextPortalCheck = now + 1.4f;
+                _nextSafeCheck = 0f;
+                _nextForcedSafe = 0f;
+                _wasNight = false;   // 换岛后重新判定：夜间登岛时也要走一次入夜分配流程
+            }
+            catch { }
+        }
+
         private void RefreshCaches()
         {
             _cachedPlayer = null;
@@ -147,6 +197,7 @@ namespace BetterKingdom
                 catch { _cachedPlayer2 = null; }
 
                 _cachedCastle = kingdom.castle;
+                TrackKingdomChange(kingdom);
             }
             catch { }
 
@@ -276,6 +327,9 @@ namespace BetterKingdom
                 // 禁用守墙排队（不依赖墙体缓存，先执行）
                 DisableWallQueueing(kingdom);
 
+                // 修正非法守墙侧（不依赖墙体缓存，先执行）
+                FixInvalidGuardSides(kingdom);
+
                 CollectWallBounds(kingdom);
                 if (_wallBounds.Count == 0) return;
                 // 需要城堡位置判断"墙后"是哪一侧
@@ -283,6 +337,112 @@ namespace BetterKingdom
 
                 FixGuardSlotsInsideWalls(kingdom, castleX);
                 FixArchersInsideWalls(kingdom, castleX);
+            }
+            catch { }
+        }
+
+        // ==================== 白天安全态兜底 ====================
+
+        /// <summary>
+        /// 白天兜底让王国进入“安全”状态。
+        /// 已确认的游戏逻辑：Worker.ShouldShelter 在 Kingdom.isSafe 为假时返回真（工人缩回营地、不接活），
+        /// Archer.ShouldHunt 在 Kingdom.isSafe 为假时直接返回假（白天不出去打猎）。
+        /// 正常情况下由 Kingdom.Update 每帧调用 CheckBecomeSafe 完成“白天 + 无危险”的安全转换，
+        /// 但换岛后该转换偶发失灵（isSafe 一直停在 false），表现就是工人与弓箭手都停在营地附近无行为。
+        /// BecomeSafe 自身只要求当前“非安全”，不检查昼夜与危险，所以这里先自行确认
+        /// “白天 + EnemyManager.IsDangerous 为假”再调用，避免夜间或怪物进攻时错误放工人出城。
+        /// </summary>
+        private static void EnsureDaytimeSafe()
+        {
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                if (managers == null) return;
+                Director director = managers.director;
+                if (director == null || !director.IsDaytime) return;
+                Kingdom kingdom = managers.kingdom;
+                if (kingdom == null) return;
+
+                // 换岛后 Kingdom 是全新实例：重置强制转换的节流，让安全态立即重新评估
+                int kid;
+                try { kid = kingdom.GetInstanceID(); } catch { kid = _safeLastKingdomId; }
+                if (kid != _safeLastKingdomId)
+                {
+                    _safeLastKingdomId = kid;
+                    _nextForcedSafe = 0f;
+                }
+
+                bool safe;
+                try { safe = kingdom.isSafe; } catch { return; }
+                if (safe) return;
+
+                bool dangerous;
+                try
+                {
+                    EnemyManager em = managers.enemies;
+                    dangerous = em != null && em.IsDangerous;
+                }
+                catch { dangerous = true; }
+                // EnemyManager 的危险计数（_enemiesAttacking / _retaliationsQueued）在换岛后可能残留，
+                // 导致白天永远进不了安全态；以“实际还有出击怪物”为准，计数残留时照样允许转安全
+                if (dangerous && (IsSideUnderAttack(Side.Left) || IsSideUnderAttack(Side.Right))) return;
+
+                // BecomeSafe 会重跑农场/觅食/捕鱼/弓箭手整套分配流程，开销不小；
+                // 若 isSafe 因其它原因反复翻回 false，这里限频，避免每 2 秒触发一次造成画面卡顿
+                float now = Time.unscaledTime;
+                if (now < _nextForcedSafe) return;
+                _nextForcedSafe = now + ForcedSafeCooldown;
+                try { kingdom.BecomeSafe(); } catch { }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 夜间兜底转入“非安全”状态。
+        /// 已确认的游戏逻辑：Archer.ShouldGoToWall 在 Kingdom.isSafe 为真时不会强制上墙，
+        /// Archer.ShouldHunt 在 isSafe 为真时会继续打猎。游戏只在真正检测到危险时调用 BecomeUnsafe，
+        /// 换岛/平静的第一夜没有触发，于是弓箭手整夜在外打猎，直到怪物逼近才被驱赶回墙内。
+        /// 这里在夜间主动调用 BecomeUnsafe：它只做守墙/长矛手重分配（DistributeTowerArchers /
+        /// DistributeFreeArchers / DistributePikemen），天亮后由 EnsureDaytimeSafe 转回安全，
+        /// 与游戏原生昼夜循环一致。夜间已处于非安全（真有进攻）时不做任何事。
+        /// </summary>
+        private static void EnsureNightUnsafe()
+        {
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                if (managers == null) return;
+                Director director = managers.director;
+                if (director == null) return;
+                bool night = !director.IsDaytime;
+
+                // 入夜瞬间：完整复刻 Kingdom.Update 的原生入夜分支（转非安全 + 重分守墙位）。
+                // 换岛（尤其夜间登岛）后 Kingdom 内部的昼夜标记可能已与当前时间不一致，
+                // Update 会因“标记未翻转”跳过整段入夜逻辑，导致首夜弓箭手继续在外打猎。
+                if (night && !_wasNight)
+                {
+                    Kingdom k = managers.kingdom;
+                    if (k != null)
+                    {
+                        try { k.isSafe = false; } catch { }
+                        try { k.DistributeTowerArchers(); } catch { }
+                        try { k.DistributeFreeArchers(); } catch { }
+                        try { k.DistributePikemenForSide(Side.Left); } catch { }
+                        try { k.DistributePikemenForSide(Side.Right); } catch { }
+                    }
+                }
+                _wasNight = night;
+                if (!night) return;
+
+                Kingdom kingdom = managers.kingdom;
+                if (kingdom == null) return;
+                bool safe;
+                try { safe = kingdom.isSafe; } catch { return; }
+                if (!safe) return;                                    // 已是非安全：原生判断已生效
+                try { kingdom.BecomeUnsafe(); } catch { }
+                // BecomeUnsafe 末尾会调用一个外部对象，换岛后该对象可能缺失而抛异常；
+                // 此时直接改写安全标记兜底，保证 ShouldHunt/ShouldGoToWall 的原生判断回到“非安全”分支
+                try { if (kingdom.isSafe) kingdom.isSafe = false; } catch { }
             }
             catch { }
         }
@@ -338,7 +498,9 @@ namespace BetterKingdom
                     int count = archers.Count;
                     if (count > 0)
                     {
-                        var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(count);
+                        if (_archerBuffer == null || _archerBuffer.Length < count)
+                            _archerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(Math.Max(count, 64));
+                        var arr = _archerBuffer;
                         archers.CopyTo(arr, 0);
                         for (int i = 0; i < count; i++)
                         {
@@ -370,7 +532,9 @@ namespace BetterKingdom
                 if (knights == null) return;
                 int count = knights.Count;
                 if (count <= 0) return;
-                var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight>(count);
+                if (_knightBuffer == null || _knightBuffer.Length < count)
+                    _knightBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight>(Math.Max(count, 16));
+                var arr = _knightBuffer;
                 knights.CopyTo(arr, 0);
                 for (int i = 0; i < count; i++)
                 {
@@ -407,7 +571,9 @@ namespace BetterKingdom
                     int count = archers.Count;
                     if (count > 0)
                     {
-                        var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(count);
+                        if (_archerBuffer == null || _archerBuffer.Length < count)
+                            _archerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(Math.Max(count, 64));
+                        var arr = _archerBuffer;
                         archers.CopyTo(arr, 0);
                         for (int i = 0; i < count; i++)
                         {
@@ -434,7 +600,9 @@ namespace BetterKingdom
                     int count = knights.Count;
                     if (count > 0)
                     {
-                        var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight>(count);
+                        if (_knightBuffer == null || _knightBuffer.Length < count)
+                            _knightBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight>(Math.Max(count, 16));
+                        var arr = _knightBuffer;
                         knights.CopyTo(arr, 0);
                         for (int i = 0; i < count; i++)
                         {
@@ -454,6 +622,50 @@ namespace BetterKingdom
             _savedKnightRank.Clear();
         }
 
+        // ==================== 非法守墙侧修正 ====================
+
+        /// <summary>
+        /// 修正非法的守墙侧：Side 只有 Left=-1 / Right=1，0 表示“尚未分配”。
+        /// 根因：换岛时随船或从该岛存档恢复的弓箭手可能保留 Side=0；
+        /// Archer.Behaviour 的打猎目标 X = Kingdom.GetBorderSide(_guardSide) + Random.Range(borderHuntRange) * _guardSide，
+        /// 而 Sided 取值对非 Left 一律返回 right，随机距离又被 0 乘掉，目标恰好落在右侧城墙位置，
+        /// 弓箭手走到墙边原地等待，白天也不出去打猎（ShouldHunt 不校验 guardSide，状态机不会自行纠正）。
+        /// 另外读档后王国若已是安全状态，Kingdom.CheckBecomeSafe 会因 isSafe 已为真而跳过 DistributeFreeArchers，
+        /// 非法侧值可能长期保留，所以这里做周期性兜底。
+        /// 只处理空闲猎手（无守墙槽/无骑士/未上船），按坐标相对露营火堆的左右侧补齐合法侧，排队深度归 0。
+        /// </summary>
+        private static void FixInvalidGuardSides(Kingdom kingdom)
+        {
+            try
+            {
+                Il2CppSystem.Collections.Generic.ICollection<Archer> archers = kingdom.Archers;
+                if (archers == null) return;
+                int count = archers.Count;
+                if (count <= 0) return;
+                if (_archerBuffer == null || _archerBuffer.Length < count)
+                    _archerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(Math.Max(count, 64));
+                var arr = _archerBuffer;
+                archers.CopyTo(arr, 0);
+                for (int i = 0; i < count; i++)
+                {
+                    Archer a = arr[i];
+                    if (a == null) continue;
+                    try
+                    {
+                        Side side = a._guardSide;
+                        if (side == Side.Left || side == Side.Right) continue;
+                        // 塔上/骑士麾下/上船中的弓箭手由各自机制管理，不改动
+                        if (!a.isAvailable) continue;
+
+                        float x = a.transform.position.x;
+                        a.SetGuardSide(SideFromX(kingdom, x), 0);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
         /// <summary>收集真实墙体的水平边界（中心X与半宽），供弓箭手守墙bug修正使用。</summary>
         private void CollectWallBounds(Kingdom kingdom)
         {
@@ -464,13 +676,15 @@ namespace BetterKingdom
                 if (walls == null) return;
                 int count = walls.Count;
                 if (count <= 0) return;
-                var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall>(count);
+                if (_wallBuffer == null || _wallBuffer.Length < count)
+                    _wallBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall>(Math.Max(count, 16));
+                var arr = _wallBuffer;
                 walls.CopyTo(arr, 0);
                 for (int i = 0; i < count; i++)
                 {
                     Wall wall = arr[i];
                     if (!TryGetX(wall, out float x)) continue;
-                    // 墙体半宽：优先取碰撞体世界边界，失败用经验值 1
+                    // 墙体半宽：优先取碰撞体世界边界，失败用经验值 1（在建城墙通常还没有碰撞体，会走经验值）
                     float halfW = 1f;
                     try
                     {
@@ -511,7 +725,9 @@ namespace BetterKingdom
                 Il2CppSystem.Collections.Generic.HashSet<GuardSlot> slots = kingdom._guardSlots;
                 if (slots == null || slots.Count <= 0) return;
                 int slotCount = slots.Count;
-                var slotArr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<GuardSlot>(slotCount);
+                if (_guardSlotBuffer == null || _guardSlotBuffer.Length < slotCount)
+                    _guardSlotBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<GuardSlot>(Math.Max(slotCount, 16));
+                var slotArr = _guardSlotBuffer;
                 slots.CopyTo(slotArr, 0);
                 for (int i = 0; i < slotCount; i++)
                 {
@@ -547,7 +763,9 @@ namespace BetterKingdom
                 if (archers == null) return;
                 int count = archers.Count;
                 if (count <= 0) return;
-                var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(count);
+                if (_archerBuffer == null || _archerBuffer.Length < count)
+                    _archerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(Math.Max(count, 64));
+                var arr = _archerBuffer;
                 archers.CopyTo(arr, 0);
                 for (int i = 0; i < count; i++)
                 {
@@ -674,7 +892,9 @@ namespace BetterKingdom
                 int count = workers.Count;
                 if (count <= 0) return;
 
-                var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(count);
+                if (_workerBuffer == null || _workerBuffer.Length < count)
+                    _workerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(count, 32));
+                var arr = _workerBuffer;
                 workers.CopyTo(arr, 0);
 
                 int kept = 0;
@@ -702,51 +922,53 @@ namespace BetterKingdom
             catch { }
         }
 
-        // ==================== 夜晚工人避险（墙外有进攻怪物时不工作） ====================
+        // ==================== 工人避险（墙外有进攻怪物时撤回，不区分昼夜） ====================
 
         /// <summary>
-        /// 夜晚检测两侧城墙外是否有"进攻状态"的怪物（存活、未撤退、未携带战利品逃走）。
+        /// 检测两侧城墙外是否有"进攻状态"的怪物（存活、未撤退、未携带战利品逃走）。
         /// 墙外有待执行工作时工人会优先去干活而不是退回城墙，速度又不及怪物，容易被攻击；
-        /// 这里在检测结果由"无"变"有"时撤销该侧工人已排队但未开始的墙外工作，
-        /// 新工作由 AssignJob 的 Prefix 拦截，避免每帧反复改动游戏状态。
+        /// 因此每次刷新都逐个工作点评估“是否还能安全撤离”：能撤离就继续干活，
+        /// 不能撤离才撤销（已排队与正在进行的工作都撤回），新工作由 AssignJob 的 Prefix 同样评估。
         /// </summary>
         private void RefreshSideAssault()
         {
-            bool wasLeft = _attackOnLeft, wasRight = _attackOnRight;
             _attackOnLeft = _attackOnRight = false;
             try
             {
                 Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Director director = managers != null ? managers.director : null;
-                if (director == null || director.IsDaytime) return;   // 白天不处理
-
-                Kingdom kingdom = managers.kingdom;
-                if (kingdom == null) return;
-                if (!TryGetX(kingdom.castle, out float castleX)) return;   // 无城堡时无法判断侧别
-
-                EnemyManager em = managers.enemies;
-                var all = em != null ? em.AllEnemies : null;
-                if (all == null || all.Count <= 0) return;
-
-                if (_assaultEnemyBuffer == null || _assaultEnemyBuffer.Length < all.Count)
-                    _assaultEnemyBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy>(Math.Max(all.Count, 16));
-                all.CopyTo(_assaultEnemyBuffer, 0);
-
-                for (int i = 0; i < all.Count; i++)
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                // 不按昼夜判断：传送门离城墙较远时游戏会在天黑前提前放怪，
+                // 只在夜间检测会把这些白天出击的怪物完全忽略
+                if (kingdom != null)
                 {
-                    Enemy e = _assaultEnemyBuffer[i];
-                    if (!IsAssaultingEnemy(e)) continue;
-                    if (!TryGetX(e, out float x)) continue;
-                    bool within;
-                    try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
-                    if (within) continue;   // 城墙内的怪物不算威胁
-                    if (x < castleX) _attackOnLeft = true; else _attackOnRight = true;
+                    if (!TryGetX(kingdom.castle, out float castleX)) { }   // 无城堡时无法判断侧别
+                    else
+                    {
+                        EnemyManager em = managers.enemies;
+                        var all = em != null ? em.AllEnemies : null;
+                        if (all != null && all.Count > 0)
+                        {
+                            if (_assaultEnemyBuffer == null || _assaultEnemyBuffer.Length < all.Count)
+                                _assaultEnemyBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy>(Math.Max(all.Count, 16));
+                            all.CopyTo(_assaultEnemyBuffer, 0);
+
+                            for (int i = 0; i < all.Count; i++)
+                            {
+                                Enemy e = _assaultEnemyBuffer[i];
+                                if (!IsAssaultingEnemy(e)) continue;
+                                if (!TryGetX(e, out float x)) continue;
+                                if (x < castleX) _attackOnLeft = true; else _attackOnRight = true;
+                            }
+                        }
+                    }
                 }
             }
             catch { }
 
-            if (_attackOnLeft && !wasLeft) CancelOutsideNightWork(Side.Left);
-            if (_attackOnRight && !wasRight) CancelOutsideNightWork(Side.Right);
+            // 无论是否检测到怪物都必须走到这里：怪物被驱赶/撤退后 AllEnemies 可能已空，
+            // 之前在这种情况直接 return，导致被取消的工作永远还不回去（工人整夜闲置）
+            CancelUnsafeOutsideWork(Side.Left);
+            CancelUnsafeOutsideWork(Side.Right);
             RestoreCancelledJobs();
         }
 
@@ -764,21 +986,21 @@ namespace BetterKingdom
             for (int i = _cancelledJobs.Count - 1; i >= 0; i--)
             {
                 CancelledJob c = _cancelledJobs[i];
-                if (IsSideUnderAttack(c.Side)) continue;   // 该侧仍有威胁，保持取消
-
+                if (c.Worker == null || c.Job == null) { _cancelledJobs.RemoveAt(i); continue; }
+                float x;
+                if (!TryGetX(c.Job, out x)) { _cancelledJobs.RemoveAt(i); continue; }
+                bool within;
+                try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
+                if (within) { _cancelledJobs.RemoveAt(i); continue; }   // 工作已改到墙内或失效，不再恢复
+                if (!IsWorkSiteSafe(kingdom, x, c.Side)) continue;   // 工作点仍不安全，保持取消
+                bool busy;
+                try { busy = c.Worker._queuedWork != null || c.Worker._currentWork != null; } catch { busy = true; }
+                if (busy) { _cancelledJobs.RemoveAt(i); continue; }   // 工人已有活干
+                bool available;
+                try { available = c.Job.JobAvailable(); } catch { available = false; }
+                if (!available) { _cancelledJobs.RemoveAt(i); continue; }   // 工作位已被别人占了或已完成
                 _cancelledJobs.RemoveAt(i);
-                try
-                {
-                    if (c.Worker == null || c.Job == null) continue;
-                    if (!TryGetX(c.Job, out float x)) continue;
-                    bool within;
-                    try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
-                    if (within) continue;   // 工作已经被改到墙内或失效，不再恢复
-                    if (c.Worker._queuedWork != null || c.Worker._currentWork != null) continue;   // 工人已有活干
-                    if (!c.Job.JobAvailable()) continue;   // 工作位已被别人占了或已完成
-                    c.Worker.AssignJob(c.Job);
-                }
-                catch { }
+                try { c.Worker.AssignJob(c.Job); } catch { }
             }
         }
 
@@ -876,7 +1098,7 @@ namespace BetterKingdom
             return false;
         }
 
-        /// <summary>夜晚该侧城墙外是否有进攻中的怪物（供 AssignJob 拦截新工作）。</summary>
+        /// <summary>该侧城墙外是否有进攻中的怪物（含天黑前提前出击的怪物）。</summary>
         public static bool IsSideUnderAttack(Side side)
         {
             if (side == Side.Left) return _attackOnLeft;
@@ -884,14 +1106,19 @@ namespace BetterKingdom
             return false;
         }
 
-        /// <summary>撤销该侧工人已排队但尚未开始的墙外工作（墙内工作与守城岗位不动）。</summary>
-        private static void CancelOutsideNightWork(Side side)
+        /// <summary>
+        /// 撤销该侧工人“已无法安全撤离”的墙外工作（墙内工作与守城岗位不动）。
+        /// 已排队未开始的工作与正在做的工作都撤回：工人继续留在墙外会被追上。
+        /// 工作点仍在安全撤离距离内时不做任何改动，工人可以一直干活。
+        /// </summary>
+        private static void CancelUnsafeOutsideWork(Side side)
         {
             try
             {
                 Managers managers = SingletonMonoBehaviour<Managers>.Inst;
                 Kingdom kingdom = managers != null ? managers.kingdom : null;
                 if (kingdom == null) return;
+                if (!IsSideUnderAttack(side)) return;
                 var workers = kingdom.Workers;
                 if (workers == null || workers.Count <= 0) return;
 
@@ -904,26 +1131,99 @@ namespace BetterKingdom
                 {
                     Worker w = _assaultWorkerBuffer[i];
                     if (w == null) continue;
-                    Side targetSide;
-                    try { targetSide = w._targetSide; } catch { continue; }
-                    if (targetSide != side) continue;
-                    Workable queued;
-                    try { queued = w._queuedWork; } catch { continue; }
-                    if (queued == null) continue;
-                    if (!TryGetX(queued, out float x)) continue;
-                    bool within;
-                    try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
-                    if (within) continue;
-                    // 必须走游戏自己的取消流程：CancelWork 会释放该工作位的占用并回调 OnJobCancel。
-                    // 直接置空 _queuedWork 会留下没人释放的工作位，之后同类工作不再被分配，
-                    // 表现为"本侧没怪了也只剩新任务能触发工人出门"
-                    try { queued.CancelWork(w); } catch { }
-                    try { w._queuedWork = null; } catch { }
-                    // 记下来，威胁解除后还给原工人（游戏夜间不会再分配工作）
-                    if (_cancelledJobs.Count < 64) _cancelledJobs.Add(new CancelledJob { Worker = w, Job = queued, Side = side });
+                    Workable queued = null, current = null;
+                    try { queued = w._queuedWork; current = w._currentWork; } catch { continue; }
+                    CancelIfUnsafe(kingdom, w, queued);
+                    CancelIfUnsafe(kingdom, w, current);
                 }
             }
             catch { }
+        }
+
+        /// <summary>单个工作位：不安全则走游戏自己的取消流程并记录，安全则保持不动。</summary>
+        private static void CancelIfUnsafe(Kingdom kingdom, Worker w, Workable job)
+        {
+            if (job == null) return;
+            float x;
+            if (!TryGetX(job, out x)) return;
+            // 侧别按工作点位置判定：白天工人的 _targetSide 可能仍为 0（游戏只在夜间分配侧别），
+            // 依赖它会漏掉白天的墙外工作
+            Side side = SideFromX(kingdom, x);
+            if (IsWorkSiteSafe(kingdom, x, side)) return;
+            // 必须走游戏自己的取消流程：CancelWork 会释放该工作位的占用并回调 OnJobCancel。
+            // 直接置空 _queuedWork 会留下没人释放的工作位，之后同类工作不再被分配，
+            // 表现为“本侧没怪了也只剩新任务能触发工人出门”
+            try { job.CancelWork(w); } catch { }
+            try { if (w._queuedWork == job) w._queuedWork = null; } catch { }
+            if (_cancelledJobs.Count < 64) _cancelledJobs.Add(new CancelledJob { Worker = w, Job = job, Side = side });
+        }
+
+        /// <summary>
+        /// 判断墙外工作点是否安全：使用固定安全距离，不做速度推算。
+        /// 工作点离该侧城墙外沿超过 SafeWorkDistance 时，只要该侧有怪物出击就判定不安全（撤回墙内驻守）；
+        /// 安全距离以内可以一直工作。墙内工作始终允许；还没有城墙时以城堡位置为参照。
+        /// </summary>
+        public static bool IsWorkSiteSafe(Kingdom kingdom, float workX, Side side)
+        {
+            try
+            {
+                if (!IsSideUnderAttack(side)) return true;   // 该侧没有出击的怪物：任何位置都安全
+
+                bool within;
+                try { within = kingdom.IsWithinWalls(workX); } catch { within = true; }
+                if (within) return true;                    // 墙内工作不受影响
+
+                float outerX;
+                if (!TryGetOuterWallX(kingdom, side, out outerX)) return false;   // 连城堡位置都取不到时按不安全处理
+
+                return Mathf.Abs(workX - outerX) <= SafeWorkDistance;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// 取该侧城墙外沿 X：只统计城堡该侧（左侧 X &lt; 城堡X、右侧 X &gt; 城堡X）的墙，
+        /// 左侧取最左墙的左边缘、右侧取最右墙的右边缘；该侧还没有城墙时退回城堡位置（主城旁），
+        /// 避免拿另一侧的城墙当参照。
+        /// </summary>
+        private static bool TryGetOuterWallX(Kingdom kingdom, Side side, out float x)
+        {
+            x = 0f;
+            float castleX;
+            bool hasCastle = TryGetX(kingdom != null ? kingdom.castle : null, out castleX);
+            int n = _wallBounds.Count;
+            bool found = false;
+            float best = 0f;
+            for (int i = 0; i < n; i++)
+            {
+                WallBound b = _wallBounds[i];
+                // 只统计城堡这一侧的墙：对侧的墙不能作为本侧的安全距离参照
+                if (hasCastle)
+                {
+                    if (side == Side.Left && b.X > castleX) continue;
+                    if (side == Side.Right && b.X < castleX) continue;
+                }
+                float edge = side == Side.Left ? b.X - b.HalfW : b.X + b.HalfW;
+                if (!found || (side == Side.Left ? edge < best : edge > best))
+                {
+                    best = edge;
+                    found = true;
+                }
+            }
+            if (found)
+            {
+                x = best;
+                return true;
+            }
+            // 该侧没有城墙（或尚未建成）：以城堡（营地）位置为参照，
+            // 否则会因为没有墙而把所有墙外工作都判成危险，连第一道墙都建不起来
+            if (hasCastle)
+            {
+                x = castleX;
+                return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -975,7 +1275,7 @@ namespace BetterKingdom
         }
 
         /// <summary>按露营火堆位置判断世界坐标位于地图哪一侧。</summary>
-        private static Side SideFromX(Kingdom kingdom, float x)
+        internal static Side SideFromX(Kingdom kingdom, float x)
         {
             float divider = 0f;
             try { divider = kingdom.CampfireWorldPosition; } catch { }
@@ -1098,8 +1398,9 @@ namespace BetterKingdom
     }
 
     /// <summary>
-    /// 夜晚该侧城墙外有进攻怪物时，拒绝接受新的墙外工作（墙内工作与守城岗位照常）。
-    /// 工人速度不及怪物，被派去远处墙外工作会被追上攻击。
+    /// 该侧城墙外有进攻怪物时，按“安全撤离距离”过滤新的墙外工作：
+    /// 工人来得及跑回城墙且怪物追不上的工作点照常接受；否则拒绝（墙内工作与守城岗位始终允许）。
+    /// 不区分昼夜：白天传送门较远时游戏会提前放怪。
     /// </summary>
     [HarmonyPatch(typeof(Worker), nameof(Worker.AssignJob))]
     public static class WorkerNightOutsideWorkPatch
@@ -1109,14 +1410,18 @@ namespace BetterKingdom
             try
             {
                 if (__instance == null || job == null) return true;
-                if (!FeatureBehaviour.IsSideUnderAttack(__instance._targetSide)) return true;
 
                 Managers managers = SingletonMonoBehaviour<Managers>.Inst;
                 Kingdom kingdom = managers != null ? managers.kingdom : null;
                 if (kingdom == null) return true;
 
                 float x = job.transform.position.x;
-                return kingdom.IsWithinWalls(x);   // 墙内工作允许，墙外工作拒绝
+                // 侧别按工作点位置判定：白天工人的 _targetSide 可能仍为 0（游戏只在夜间分配侧别）
+                Side side = FeatureBehaviour.SideFromX(kingdom, x);
+                if (!FeatureBehaviour.IsSideUnderAttack(side)) return true;
+
+                // 固定安全距离内允许出门工作；超出该距离且该侧有怪物出击就拒绝
+                return FeatureBehaviour.IsWorkSiteSafe(kingdom, x, side);
             }
             catch { }
             return true;

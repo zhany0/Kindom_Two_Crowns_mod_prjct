@@ -116,6 +116,12 @@
 9. **付费攻门小队优先级**：入口是 `PayableBorder.Pay()`（玩家付费后由 `Payable.PerformPay()` 虚调用），原版在 `Kingdom.Knights` 哈希集上遍历，只按 `Knight.numArchers` 取最大，人数相同则"后遍历者"胜出（顺序随机），不看 `_wasPromoted`。
    模组做法：`PayableBorder.Pay` Prefix 里按 `CanCharge()` + `|kx-border.x| <= knightRange` 筛出候选，排序键为 人数 > `_wasPromoted` > 距离更近，记下实例 ID；同期间 `Knight.CanCharge` Postfix 只放行该 ID，使原版循环必然选中它；Postfix 清理上下文。计算候选时用 `_chargePicking` 标志绕过 `CanCharge` 自身过滤，避免递归。
    小队人数 = `Knight._archers` 的 `Count`（`numArchers`），上限 `_maxArchers`（prefab 值 4）；`_numAdditionalChargeFollowers` 是冲锋时招募狂战士的参数，不是人数依据。
+10. **弓箭手打猎依赖 `_guardSide` 为 ±1**：`Side` 只有 `Left=-1 / Right=1`，0 是"尚未分配"的非法值。
+    `Archer.Behaviour` 的 Hunt 子句（协程 state 40）目标 X = `Kingdom.GetBorderSide(_guardSide) + Random.Range(borderHuntRange.min,max) * _guardSide`，
+    `Sided<T>` 对非 Left 一律返回 right，所以 `side=0` 时目标恰好等于**右侧边界（城墙）**坐标；`ShouldHunt()` 不校验 guardSide，弓箭手会在墙边原地等待，白天也不出去打猎。
+    非法侧值来源：换岛时随船（`OnDisembarkComplete → ConvertToHunter` 不清侧值）或从岛屿存档恢复的"未分配"弓箭手。
+    自愈路径只有 `Kingdom.CheckBecomeSafe()` → `DistributeFreeArchers()`（清晨安全转换时按 `Archer.isAvailable` 重新分配侧与深度），
+    但读档后王国若 `isSafe` 已为真，该路径会被直接跳过，非法侧值可长期保留。模组兜底：`FeatureBehaviour.FixInvalidGuardSides` 周期性给非法侧的空闲猎手按坐标相对露营火堆补合法侧、深度归 0。
 
 ## 5. 未知字段/方法怎么查（逆向工具链）
 
