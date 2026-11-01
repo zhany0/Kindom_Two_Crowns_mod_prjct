@@ -8,6 +8,7 @@ namespace BetterKingdom
     /// <summary>
     /// 屏幕顶部小地图 + 游戏信息面板。
     /// 黄色线表示整张地图，色点标注玩家/城堡/传送门/洞窟/城墙位/箭塔位。
+    /// 红色竖线标出两侧的“安全距离”边界（该侧有怪物出击时，工人越界就会跑回城墙避险）。
     /// 紫色竖线实时标注怪物波次位置：按 waveID 分组，每批怪物只绘制距离最近的怪物位置。
     /// 左上显示金币（钱袋/国库）与职业统计（含骑士小队弓箭手/高级骑士细分、左右侧火油桶统计），左下显示时间/当前季节天数。
     /// </summary>
@@ -34,8 +35,8 @@ namespace BetterKingdom
         private const int JobFontSize = 20;
 
         //   纹理/样式  
-        private Texture2D _texYellow, _texPlayer, _texPortal, _texWall, _texTower, _texEnemy, _texCastle;
-        private GUIStyle _styleYellow, _stylePlayer, _stylePortal, _styleWall, _styleTower, _styleEnemy, _styleCastle;
+        private Texture2D _texYellow, _texPlayer, _texPortal, _texWall, _texTower, _texEnemy, _texCastle, _texSafeEdge;
+        private GUIStyle _styleYellow, _stylePlayer, _stylePortal, _styleWall, _styleTower, _styleEnemy, _styleCastle, _styleSafeEdge;
         private GUIStyle _styleLabel, _styleInfo, _styleJob;
 
         //   缓存坐标  
@@ -165,6 +166,7 @@ namespace BetterKingdom
             _texWall = MakeSolidTexture(new Color(0.62f, 0.62f, 0.66f, 1f));   // 城墙：灰
             _texTower = MakeSolidTexture(new Color(0.76f, 0.55f, 0.32f, 1f));  // 箭塔：木色
             _texEnemy = MakeSolidTexture(new Color(0.55f, 0.15f, 0.75f, 1f));  // 怪物竖线：较深紫
+            _texSafeEdge = MakeSolidTexture(new Color(1f, 0.2f, 0.15f, 1f));   // 安全距离红线
             _texCastle = MakeSolidTexture(new Color(1f, 1f, 1f, 1f));
             _texCamp = MakeSolidTexture(new Color(0.95f, 0.55f, 0.15f, 1f));   // 难民营：橙
             _texStatue = MakeSolidTexture(new Color(0.55f, 0.72f, 0.6f, 1f));  // 雕像：灰绿
@@ -183,6 +185,7 @@ namespace BetterKingdom
             _styleWall = MakeSolidStyle(_texWall);
             _styleTower = MakeSolidStyle(_texTower);
             _styleEnemy = MakeSolidStyle(_texEnemy);
+            _styleSafeEdge = MakeSolidStyle(_texSafeEdge);
             _styleCastle = MakeSolidStyle(_texCastle);
             _styleCamp = MakeSolidStyle(_texCamp);
             _styleStatue = MakeSolidStyle(_texStatue);
@@ -1583,6 +1586,9 @@ namespace BetterKingdom
                 GUI.Box(new Rect(LeftMargin, centerY - LineThickness * 0.5f,
                     screenW - LeftMargin - RightMargin, LineThickness), GUIContent.none, _styleYellow);
 
+                // 安全距离红线：两条竖线之间是工人可以停留/工作的区域，越界且该侧有怪物出击就会跑回城墙
+                DrawSafeEdgeLines(frameH);
+
                 if (_hasPlayer)
                     DrawDotWithLabel(_playerX, centerY, DotRadius, _stylePlayer, "玩家", true);
                 if (_hasCastle)
@@ -1686,6 +1692,20 @@ namespace BetterKingdom
                     GUI.Label(new Rect(infoX, infoPanelY + infoRow * infoLineH, 290f, infoLineH), _strSeason, _styleInfo);
                 }
             }
+        }
+
+        /// <summary>
+        /// 绘制安全距离红线：位置由 FeatureBehaviour.TryGetSafeEdge 给出（城墙外沿向外偏移 SafeDistance，
+        /// 该侧无城墙时从主城位置起算），线条贯穿地图框高度，与怪物紫线同高。
+        /// </summary>
+        private void DrawSafeEdgeLines(float frameH)
+        {
+            const float halfW = 1.5f;
+            float x;
+            if (FeatureBehaviour.TryGetSafeEdge(Side.Left, out x))
+                GUI.Box(new Rect(ToScreenX(x) - halfW, 3f, halfW * 2f, frameH - 6f), GUIContent.none, _styleSafeEdge);
+            if (FeatureBehaviour.TryGetSafeEdge(Side.Right, out x))
+                GUI.Box(new Rect(ToScreenX(x) - halfW, 3f, halfW * 2f, frameH - 6f), GUIContent.none, _styleSafeEdge);
         }
 
         private float ToScreenX(float worldX)

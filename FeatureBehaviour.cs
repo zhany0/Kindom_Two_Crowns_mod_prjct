@@ -23,7 +23,7 @@ namespace BetterKingdom
         private const float PayHoldThreshold = 0.4f; // 长按判定阈值（秒），短点击不触发取款
         private const int PortalSideWorkerLimit = 2; // 传送门被摧毁后该侧保留的工人数
         private const float SafeCheckInterval = 2f;     // 白天安全态兜底检查间隔
-        private const float SafeWorkDistance = 20f;     // 墙外工作固定安全距离：距该侧城墙外沿超过此值，该侧有怪物出击就撤回
+        private const float SafeDistance = 20f;         // 避险安全距离：工人位置距该侧城墙外沿（无墙时距主城）超过此值且该侧有怪物出击，就跑回城墙
         private const float ForcedSafeCooldown = 15f;   // 强制安全转换的最小间隔（转换会重跑整套分配流程，不能高频触发）
 
         private Player _cachedPlayer;
@@ -54,16 +54,17 @@ namespace BetterKingdom
         private static float _nextAssaultCheck;       // 下一次夜间进攻怪物检测时刻
         private static bool _attackOnLeft, _attackOnRight;   // 夜晚该侧城墙外是否有进攻中的怪物
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _assaultEnemyBuffer;
-        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _assaultWorkerBuffer;
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _suspendWorkerBuffer;
+        // 该侧出现进攻怪物时被暂时撤下的“排队工作”（还没开始做）：怪物归零后立即还给原工人。
+        // 只撤排队工作、不撤 _currentWork——正在干的活按原生逻辑干完再避险。
+        private struct SuspendedJob { public Worker Worker; public Workable Job; public Side Side; }
+        private static readonly List<SuspendedJob> _suspendedJobs = new List<SuspendedJob>();
         // 周期性遍历复用缓冲：修正流程每 2 秒执行一次，反复分配 IL2CPP 数组会造成 GC 尖峰与掉帧
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer> _archerBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall> _wallBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<GuardSlot> _guardSlotBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight> _knightBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _workerBuffer;
-        // 夜间避险时被取消的墙外工作：威胁解除后还给原工人，避免工人整夜闲置（游戏夜间不会重新分配工作）
-        private struct CancelledJob { public Worker Worker; public Workable Job; public Side Side; }
-        private static readonly List<CancelledJob> _cancelledJobs = new List<CancelledJob>();
         // 攻门（付费冲锋）小队优先级：PayableBorder.Pay 遍历骑士时只放行选中的那支小队
         private static int _chargeBestId = -1;          // 选中小队的实例 ID
         private static bool _chargePickActive;          // 处于 PayableBorder.Pay 执行期间
@@ -173,7 +174,7 @@ namespace BetterKingdom
                 if (kid == _cachedKingdomId) return;
                 _cachedKingdomId = kid;
                 _wallBounds.Clear();
-                _cancelledJobs.Clear();
+                _suspendedJobs.Clear();
                 float now = Time.unscaledTime;
                 _nextHeavyWork = now + 0.7f;     // 换岛后同样错峰，避免两个重型任务同帧执行
                 _nextPortalCheck = now + 1.4f;
@@ -400,16 +401,9 @@ namespace BetterKingdom
                 catch { eventOngoing = false; }
                 if (eventOngoing) return;
 
-                bool dangerous;
-                try
-                {
-                    EnemyManager em = managers.enemies;
-                    dangerous = em != null && em.IsDangerous;
-                }
-                catch { dangerous = true; }
-                // EnemyManager 的危险计数（_enemiesAttacking / _retaliationsQueued）在换岛后可能残留，
-                // 导致白天永远进不了安全态；以“实际还有出击怪物”为准，计数残留时照样允许转安全
-                if (dangerous && (IsSideUnderAttack(Side.Left) || IsSideUnderAttack(Side.Right))) return;
+                // 以“本侧实际还有出击怪物”为准：EnemyManager 的危险计数（_enemiesAttacking /
+                // _retaliationsQueued）在换岛后可能残留，若拿它当判据，白天会永远进不了安全态
+                if (IsSideUnderAttack(Side.Left) || IsSideUnderAttack(Side.Right)) return;
 
                 // BecomeSafe 会重跑农场/觅食/捕鱼/弓箭手整套分配流程，开销不小；
                 // 若 isSafe 因其它原因反复翻回 false，这里限频，避免每 2 秒触发一次造成画面卡顿
@@ -1040,13 +1034,14 @@ namespace BetterKingdom
         // ==================== 工人避险（墙外有进攻怪物时撤回，不区分昼夜） ====================
 
         /// <summary>
-        /// 检测两侧城墙外是否有"进攻状态"的怪物（存活、未撤退、未携带战利品逃走）。
-        /// 墙外有待执行工作时工人会优先去干活而不是退回城墙，速度又不及怪物，容易被攻击；
-        /// 因此每次刷新都逐个工作点评估“是否还能安全撤离”：能撤离就继续干活，
-        /// 不能撤离才撤销（已排队与正在进行的工作都撤回），新工作由 AssignJob 的 Prefix 同样评估。
+        /// 检测两侧是否有"进攻状态"的怪物（存活、未撤退、未携带战利品逃走）。
+        /// 结果供 Worker.ShouldShelter 补丁使用：该侧有怪物且工人自身在安全距离外时跑回城墙，
+        /// 直到该侧进攻怪物归零。正在工作的工人不打断（Work 状态优先级高于 Shelter，
+        /// 原生行为就是干完手上的活再避险）。
         /// </summary>
         private void RefreshSideAssault()
         {
+            bool wasLeft = _attackOnLeft, wasRight = _attackOnRight;
             _attackOnLeft = _attackOnRight = false;
             try
             {
@@ -1080,43 +1075,107 @@ namespace BetterKingdom
             }
             catch { }
 
-            // 无论是否检测到怪物都必须走到这里：怪物被驱赶/撤退后 AllEnemies 可能已空，
-            // 之前在这种情况直接 return，导致被取消的工作永远还不回去（工人整夜闲置）
-            CancelUnsafeOutsideWork(Side.Left);
-            CancelUnsafeOutsideWork(Side.Right);
-            RestoreCancelledJobs();
+            // 无论是否检测到怪物都要走到这里：怪物刚出时就撤下还没开始的排队工作（不再被派出去），
+            // 怪物归零后立即把工作还回去（游戏夜间不会重分配，只能靠这里）
+            SuspendUnsafeQueuedWork(Side.Left);
+            SuspendUnsafeQueuedWork(Side.Right);
+            ResumeSuspendedWork();
+
+            // 某侧进攻怪物刚归零：立即让游戏重新分配工作。
+            // 游戏原生的 Kingdom.ReassignWork 只在 Director.IsDaytime 时由 Worker.Behaviour 调用，
+            // 夜里收工后不分配，工人要等到天亮才会再出门；这里在威胁解除的瞬间补一次分配
+            if ((wasLeft && !_attackOnLeft) || (wasRight && !_attackOnRight))
+            {
+                try
+                {
+                    Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                    Kingdom kingdom = managers != null ? managers.kingdom : null;
+                    if (kingdom != null) kingdom.ReassignWork();
+                }
+                catch { }
+            }
         }
 
         /// <summary>
-        /// 把之前为避险取消的墙外工作还回去：该侧威胁解除（或天亮了）时重新给原工人排上。
-        /// 游戏在夜间不会主动分配新工作，若不还回去，工人会一直闲置到第二天才被重新派活。
+        /// 该侧有进攻怪物时，撤下工人“已经分配但还没开始”的工作（_queuedWork）。
+        /// 这是工人仍会跑去工作的根源：工作往往在怪物出现之前就已分配好，AssignJob 拦截管不到，
+        /// 而 Work 状态优先级高于 Shelter，工人会一路走到危险区。
+        /// 正在做的工作（_currentWork）不动：按原生逻辑干完手上的活，之后再进入避险回城。
         /// </summary>
-        private static void RestoreCancelledJobs()
+        private static void SuspendUnsafeQueuedWork(Side side)
         {
-            if (_cancelledJobs.Count == 0) return;
-            Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-            Kingdom kingdom = managers != null ? managers.kingdom : null;
-            if (kingdom == null) return;
-
-            for (int i = _cancelledJobs.Count - 1; i >= 0; i--)
+            if (!IsSideUnderAttack(side)) return;
+            try
             {
-                CancelledJob c = _cancelledJobs[i];
-                if (c.Worker == null || c.Job == null) { _cancelledJobs.RemoveAt(i); continue; }
-                float x;
-                if (!TryGetX(c.Job, out x)) { _cancelledJobs.RemoveAt(i); continue; }
-                bool within;
-                try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
-                if (within) { _cancelledJobs.RemoveAt(i); continue; }   // 工作已改到墙内或失效，不再恢复
-                if (!IsWorkSiteSafe(kingdom, x, c.Side)) continue;   // 工作点仍不安全，保持取消
-                bool busy;
-                try { busy = c.Worker._queuedWork != null || c.Worker._currentWork != null; } catch { busy = true; }
-                if (busy) { _cancelledJobs.RemoveAt(i); continue; }   // 工人已有活干
-                bool available;
-                try { available = c.Job.JobAvailable(); } catch { available = false; }
-                if (!available) { _cancelledJobs.RemoveAt(i); continue; }   // 工作位已被别人占了或已完成
-                _cancelledJobs.RemoveAt(i);
-                try { c.Worker.AssignJob(c.Job); } catch { }
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return;
+                var workers = kingdom.Workers;
+                if (workers == null || workers.Count <= 0) return;
+
+                if (_suspendWorkerBuffer == null || _suspendWorkerBuffer.Length < workers.Count)
+                    _suspendWorkerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(workers.Count, 16));
+                workers.CopyTo(_suspendWorkerBuffer, 0);
+
+                int count = workers.Count;
+                for (int i = 0; i < count; i++)
+                {
+                    Worker w = _suspendWorkerBuffer[i];
+                    if (w == null) continue;
+                    Workable job;
+                    try { job = w._queuedWork; } catch { continue; }
+                    if (job == null) continue;
+                    float x;
+                    if (!TryGetX(job, out x)) continue;
+                    if (IsPositionSafe(kingdom, x, SideFromX(kingdom, x))) continue;   // 工作点在安全范围内，照常去干
+
+                    // 走游戏自己的取消流程释放工作位占用，否则之后同类工作不会再被分配
+                    try { job.CancelWork(w); } catch { }
+                    try { if (w._queuedWork == job) w._queuedWork = null; } catch { }
+                    if (_suspendedJobs.Count < 64)
+                        _suspendedJobs.Add(new SuspendedJob { Worker = w, Job = job, Side = side });
+                }
             }
+            catch { }
+        }
+
+        /// <summary>
+        /// 该侧进攻怪物归零后立刻把撤下的排队工作还回去（不等天亮，游戏夜间不会重新分配工作）。
+        /// 工作位暂时不可用或被别处占用时保留记录，下次刷新再试。
+        /// </summary>
+        private static void ResumeSuspendedWork()
+        {
+            if (_suspendedJobs.Count == 0) return;
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return;
+
+                for (int i = _suspendedJobs.Count - 1; i >= 0; i--)
+                {
+                    SuspendedJob c = _suspendedJobs[i];
+                    if (c.Worker == null || c.Job == null) { _suspendedJobs.RemoveAt(i); continue; }
+                    if (IsSideUnderAttack(c.Side)) continue;   // 该侧还有进攻怪物，继续避险
+
+                    float x;
+                    if (!TryGetX(c.Job, out x)) { _suspendedJobs.RemoveAt(i); continue; }
+                    if (!IsPositionSafe(kingdom, x, SideFromX(kingdom, x))) continue;   // 工作点仍不安全，等待
+
+                    bool busy;
+                    try { busy = c.Worker._queuedWork != null || c.Worker._currentWork != null; }
+                    catch { busy = true; }
+                    if (busy) { _suspendedJobs.RemoveAt(i); continue; }   // 游戏已经重新派了活
+
+                    bool available;
+                    try { available = c.Job.JobAvailable(); } catch { available = false; }
+                    if (!available) continue;   // 工作位临时被占用，下次再试
+
+                    _suspendedJobs.RemoveAt(i);
+                    try { c.Worker.AssignJob(c.Job); } catch { }
+                }
+            }
+            catch { }
         }
 
         // ==================== 攻门（付费冲锋）小队优先级 ====================
@@ -1198,7 +1257,9 @@ namespace BetterKingdom
             return true;
         }
 
-        /// <summary>怪物是否处于进攻状态：存活、未决定撤退、未携带战利品离开。</summary>
+        /// <summary>怪物是否处于进攻状态：在场、存活、未决定撤退、未携带战利品离开。
+        /// 携带战利品（捡到金币/王冠拖回传送门）或已开始消失的怪物都不算进攻怪物，
+        /// 否则它们会在回程途中被误判成威胁，导致工人迟迟不敢出门工作。</summary>
         private static bool IsAssaultingEnemy(Enemy e)
         {
             try
@@ -1207,6 +1268,7 @@ namespace BetterKingdom
                 if (e.shouldRetreat) return false;   // 已决定撤回传送门
                 Damageable d = e.damageable;
                 if (d != null && d.isDead) return false;
+                if (!e.gameObject.activeSelf) return false;
                 return e.loot == null;   // 捡到金币/战利品逃走的怪物不再算进攻
             }
             catch { }
@@ -1222,76 +1284,66 @@ namespace BetterKingdom
         }
 
         /// <summary>
-        /// 撤销该侧工人“已无法安全撤离”的墙外工作（墙内工作与守城岗位不动）。
-        /// 已排队未开始的工作与正在做的工作都撤回：工人继续留在墙外会被追上。
-        /// 工作点仍在安全撤离距离内时不做任何改动，工人可以一直干活。
+        /// 该工人此刻是否应该跑回城墙避险：它所在的一侧有进攻中的怪物，且它自身位置在安全距离之外。
+        /// 供 Worker.ShouldShelter 补丁使用——把结果强制为真后，游戏自己的 Shelter 状态会把工人带回城墙驻守。
+        /// 不干预工作：Work 状态优先级高于 Shelter，正在干活/已排活的工会先把活干完再避险（与游戏原生一致）。
         /// </summary>
-        private static void CancelUnsafeOutsideWork(Side side)
+        public static bool ShouldFleeToWall(Worker w)
         {
+            if (!_attackOnLeft && !_attackOnRight) return false;
             try
             {
                 Managers managers = SingletonMonoBehaviour<Managers>.Inst;
                 Kingdom kingdom = managers != null ? managers.kingdom : null;
-                if (kingdom == null) return;
-                if (!IsSideUnderAttack(side)) return;
-                var workers = kingdom.Workers;
-                if (workers == null || workers.Count <= 0) return;
-
-                if (_assaultWorkerBuffer == null || _assaultWorkerBuffer.Length < workers.Count)
-                    _assaultWorkerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(workers.Count, 16));
-                workers.CopyTo(_assaultWorkerBuffer, 0);
-
-                int count = workers.Count;
-                for (int i = 0; i < count; i++)
-                {
-                    Worker w = _assaultWorkerBuffer[i];
-                    if (w == null) continue;
-                    Workable queued = null, current = null;
-                    try { queued = w._queuedWork; current = w._currentWork; } catch { continue; }
-                    CancelIfUnsafe(kingdom, w, queued);
-                    CancelIfUnsafe(kingdom, w, current);
-                }
+                if (kingdom == null) return false;
+                float x;
+                if (!TryGetX(w, out x)) return false;
+                return !IsPositionSafe(kingdom, x, SideFromX(kingdom, x));
             }
             catch { }
-        }
-
-        /// <summary>单个工作位：不安全则走游戏自己的取消流程并记录，安全则保持不动。</summary>
-        private static void CancelIfUnsafe(Kingdom kingdom, Worker w, Workable job)
-        {
-            if (job == null) return;
-            float x;
-            if (!TryGetX(job, out x)) return;
-            // 侧别按工作点位置判定：白天工人的 _targetSide 可能仍为 0（游戏只在夜间分配侧别），
-            // 依赖它会漏掉白天的墙外工作
-            Side side = SideFromX(kingdom, x);
-            if (IsWorkSiteSafe(kingdom, x, side)) return;
-            // 必须走游戏自己的取消流程：CancelWork 会释放该工作位的占用并回调 OnJobCancel。
-            // 直接置空 _queuedWork 会留下没人释放的工作位，之后同类工作不再被分配，
-            // 表现为“本侧没怪了也只剩新任务能触发工人出门”
-            try { job.CancelWork(w); } catch { }
-            try { if (w._queuedWork == job) w._queuedWork = null; } catch { }
-            if (_cancelledJobs.Count < 64) _cancelledJobs.Add(new CancelledJob { Worker = w, Job = job, Side = side });
+            return false;
         }
 
         /// <summary>
-        /// 判断墙外工作点是否安全：使用固定安全距离，不做速度推算。
-        /// 工作点离该侧城墙外沿超过 SafeWorkDistance 时，只要该侧有怪物出击就判定不安全（撤回墙内驻守）；
-        /// 安全距离以内可以一直工作。墙内工作始终允许；还没有城墙时以城堡位置为参照。
+        /// 判断某个位置在该侧是否处于安全距离内。
+        /// 该侧没有出击怪物时任何位置都安全；墙内始终安全；墙外则要求距该侧城墙外沿不超过 SafeDistance，
+        /// 该侧还没有城墙时以主城（城堡）位置为参照起算。
         /// </summary>
-        public static bool IsWorkSiteSafe(Kingdom kingdom, float workX, Side side)
+        public static bool IsPositionSafe(Kingdom kingdom, float x, Side side)
         {
             try
             {
                 if (!IsSideUnderAttack(side)) return true;   // 该侧没有出击的怪物：任何位置都安全
 
                 bool within;
-                try { within = kingdom.IsWithinWalls(workX); } catch { within = true; }
-                if (within) return true;                    // 墙内工作不受影响
+                try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
+                if (within) return true;                    // 墙内始终安全
 
                 float outerX;
                 if (!TryGetOuterWallX(kingdom, side, out outerX)) return false;   // 连城堡位置都取不到时按不安全处理
 
-                return Mathf.Abs(workX - outerX) <= SafeWorkDistance;
+                return Mathf.Abs(x - outerX) <= SafeDistance;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// 取该侧“安全距离”边界的世界 X（供小地图红线使用）：
+        /// 左侧为城墙外沿 - SafeDistance，右侧为外沿 + SafeDistance；该侧还没有城墙时以主城位置为参照。
+        /// </summary>
+        public static bool TryGetSafeEdge(Side side, out float x)
+        {
+            x = 0f;
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return false;
+                float outerX;
+                if (!TryGetOuterWallX(kingdom, side, out outerX)) return false;
+                x = side == Side.Left ? outerX - SafeDistance : outerX + SafeDistance;
+                return true;
             }
             catch { }
             return false;
@@ -1513,33 +1565,46 @@ namespace BetterKingdom
     }
 
     /// <summary>
-    /// 该侧城墙外有进攻怪物时，按“安全撤离距离”过滤新的墙外工作：
-    /// 工人来得及跑回城墙且怪物追不上的工作点照常接受；否则拒绝（墙内工作与守城岗位始终允许）。
-    /// 不区分昼夜：白天传送门较远时游戏会提前放怪。
+    /// 该侧有怪物出击时拒绝新的危险工作：不让工人接安全距离外的墙外任务跑出去。
+    /// 已经在做的活不受影响（Work 优先级高于 Shelter，干完后由 ShouldShelter 补丁带回城墙），
+    /// 与“不干预工作行为”一致；该侧无怪物、工作点墙内或安全距离内一律放行。
     /// </summary>
     [HarmonyPatch(typeof(Worker), nameof(Worker.AssignJob))]
-    public static class WorkerNightOutsideWorkPatch
+    public static class WorkerAssignSafeJobPatch
     {
-        public static bool Prefix(Worker __instance, Workable job)
+        public static bool Prefix(Workable job)
         {
             try
             {
-                if (__instance == null || job == null) return true;
-
+                if (job == null) return true;
                 Managers managers = SingletonMonoBehaviour<Managers>.Inst;
                 Kingdom kingdom = managers != null ? managers.kingdom : null;
                 if (kingdom == null) return true;
-
-                float x = job.transform.position.x;
-                // 侧别按工作点位置判定：白天工人的 _targetSide 可能仍为 0（游戏只在夜间分配侧别）
-                Side side = FeatureBehaviour.SideFromX(kingdom, x);
-                if (!FeatureBehaviour.IsSideUnderAttack(side)) return true;
-
-                // 固定安全距离内允许出门工作；超出该距离且该侧有怪物出击就拒绝
-                return FeatureBehaviour.IsWorkSiteSafe(kingdom, x, side);
+                float x;
+                try { x = job.transform.position.x; } catch { return true; }   // 取不到位置时不干预
+                return FeatureBehaviour.IsPositionSafe(kingdom, x, FeatureBehaviour.SideFromX(kingdom, x));
             }
             catch { }
             return true;
+        }
+    }
+
+    /// <summary>
+    /// 工人避险回城：游戏原生的 ShouldShelter 只在 Kingdom.isSafe 为假时才会返回真，
+    /// 白天（或换岛后王国被兜底转成安全态）即使本侧有怪物出击，工人也不会退回城墙。
+    /// 这里在“该侧有怪物出击 + 工人自身已在安全距离之外”时强制结果取真，
+    /// 让游戏自己的 Shelter 状态把工人带回城墙驻守，直到该侧进攻怪物归零。
+    /// 不干预工作：Work 状态优先级高于 Shelter，正在干活的工会先干完再撤退（与游戏原生一致）。
+    /// 注意：只改状态选择结果，全程不碰 Kingdom.isSafe 与 Director 时钟，
+    /// 因此不会重新引发“复仇血月结束后时间卡住”的问题。
+    /// </summary>
+    [HarmonyPatch(typeof(Worker), nameof(Worker.ShouldShelter))]
+    public static class WorkerRecallShelterPatch
+    {
+        public static void Postfix(Worker __instance, ref bool __result)
+        {
+            if (__result || __instance == null) return;
+            if (FeatureBehaviour.ShouldFleeToWall(__instance)) __result = true;
         }
     }
 

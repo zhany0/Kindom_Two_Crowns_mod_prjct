@@ -43,7 +43,9 @@ namespace BetterKingdom
             harmony.PatchAll(typeof(WallQueueArcherDistributionPatch));
             harmony.PatchAll(typeof(WallQueueFreeArcherDistributionPatch));
             harmony.PatchAll(typeof(WallQueueKnightRankPatch));
-            harmony.PatchAll(typeof(WorkerNightOutsideWorkPatch));
+            // 工人避险相关：该侧有怪物出击时拒绝安全距离外的新工作，并让已越界的工人回城墙驻守
+            harmony.PatchAll(typeof(WorkerAssignSafeJobPatch));
+            harmony.PatchAll(typeof(WorkerRecallShelterPatch));
             harmony.PatchAll(typeof(ChargeSquadPriorityPayPatch));
             harmony.PatchAll(typeof(ChargeSquadPriorityCanChargePatch));
         }
