@@ -37,6 +37,10 @@ namespace BetterKingdom
         private static float _nextSafeCheck, _nextForcedSafe;  // 安全态兜底检查与强制转换的节流时间
         private static int _cachedKingdomId = -1;             // 用于检测换岛（Kingdom 实例变化）
         private static bool _wasNight;                        // 上一轮昼夜判定（用于捕捉入夜瞬间）
+        private static float _nextTimePauseCheck;             // 时间停滞检测节流时间
+        private static float _lastDirectorTime = -1f;         // 上次采样到的游戏时刻（判断时钟是否真的不走）
+        private static float _timeStuckSince = -1f;           // 时钟连续停滞的起点（-1 表示时钟正常）
+        private static int _timeStuckRepairs;                 // 停滞修补轮次：0=先恢复时钟与状态，1=仍不动则清理残留时间停止者
 
         // 城墙边界缓存（供弓箭手守墙bug修正使用）
         private struct WallBound { public float X; public float HalfW; }
@@ -113,6 +117,13 @@ namespace BetterKingdom
                 _nextSafeCheck = now + SafeCheckInterval;
                 EnsureDaytimeSafe();
                 EnsureNightUnsafe();
+            }
+
+            // 血月结束后游戏可能把时钟倍率留在 0，导致时间永久停住（只有重进游戏才恢复）
+            if (now >= _nextTimePauseCheck)
+            {
+                _nextTimePauseCheck = now + 1f;
+                EnsureTimeNotStuck(now);
             }
 
             // 禁用排队时高频复钳：游戏会在夜袭等时机经其它分配路径重新写入排队深度，
@@ -376,6 +387,19 @@ namespace BetterKingdom
                 try { safe = kingdom.isSafe; } catch { return; }
                 if (safe) return;
 
+                // 红月/黑暗（攻破传送门后的复仇波次）期间绝不能强制转安全：
+                // 游戏原生收尾 EnemyManager.CheckDanger 只在 kingdom.isSafe 为假时才会执行
+                // ResumeTime + ClearRedMoon/ClearDarkness。若先把王国转成安全态，收尾分支被永久跳过，
+                // 表现就是复仇怪物清完后单位行为恢复、但时钟与画面一直卡在血月进攻状态（只有重进游戏才恢复）
+                bool eventOngoing;
+                try
+                {
+                    EnemyManager em = managers.enemies;
+                    eventOngoing = em != null && (em.isRedMoon || em.isDarkness);
+                }
+                catch { eventOngoing = false; }
+                if (eventOngoing) return;
+
                 bool dangerous;
                 try
                 {
@@ -443,6 +467,97 @@ namespace BetterKingdom
                 // BecomeUnsafe 末尾会调用一个外部对象，换岛后该对象可能缺失而抛异常；
                 // 此时直接改写安全标记兜底，保证 ShouldHunt/ShouldGoToWall 的原生判断回到“非安全”分支
                 try { if (kingdom.isSafe) kingdom.isSafe = false; } catch { }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 复仇血月/黑暗收尾兜底：攻破传送门后游戏会暂停时钟并切到红月/黑暗画面，
+        /// 正常由 EnemyManager.CheckDanger 在“无怪物攻城 + 无待出波次 + 王国处于非安全”时执行
+        /// Director.ResumeTime() 与 ClearRedMoon()/ClearDarkness() 收尾。
+        /// 一旦该分支被跳过（例如王国被提前转成安全态），时钟与画面就会永久卡在血月进攻状态，
+        /// 只有重进游戏才恢复。这里检测“红月/黑暗标记仍在 + 游戏自身已无危险 + 时钟连续数秒不动”，
+        /// 主动补齐收尾流程；若恢复倍率后时钟仍不走，再清理残留的时间停止者。
+        /// </summary>
+        private static void EnsureTimeNotStuck(float now)
+        {
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                if (managers == null) return;
+                Director director = managers.director;
+                if (director == null) return;
+                EnemyManager enemies = managers.enemies;
+
+                float time;
+                try { time = director.currentTime; } catch { return; }
+                if (_lastDirectorTime < 0f) { _lastDirectorTime = time; _timeStuckSince = -1f; return; }
+                bool moving = Mathf.Abs(time - _lastDirectorTime) > 0.0001f;
+                _lastDirectorTime = time;
+
+                bool redMoon = false, darkness = false, dangerous = true, playing = true;
+                try
+                {
+                    if (enemies != null)
+                    {
+                        redMoon = enemies.isRedMoon;
+                        darkness = enemies.isDarkness;
+                        dangerous = enemies.IsDangerous;
+                    }
+                }
+                catch { dangerous = true; }
+                try { playing = director.playing; } catch { }
+
+                // 时钟正常推进，或游戏本身处于暂停（菜单/演出/网络同步）时不做任何事
+                if (moving || !playing || Time.timeScale <= 0f)
+                {
+                    _timeStuckSince = -1f;
+                    _timeStuckRepairs = 0;
+                    return;
+                }
+                if (!redMoon && !darkness) { _timeStuckSince = -1f; _timeStuckRepairs = 0; return; }
+                // 还有怪物攻城或有待出的复波次时属于正常血月战斗（游戏会主动暂停时钟），不干预
+                if (dangerous) { _timeStuckSince = -1f; return; }
+
+                if (_timeStuckSince < 0f) { _timeStuckSince = now; return; }
+                // 连续 10 秒无危险且时钟不动才介入：留出正常波次间隔与收尾演出时间
+                if (now - _timeStuckSince < 10f) return;
+
+                if (_timeStuckRepairs == 0)
+                {
+                    // 第一轮：补齐原生收尾（恢复时钟倍率 + 清除红月/黑暗状态，含天空与材质）
+                    try { director.ResumeTime(); } catch { }
+                    try { enemies.ClearRedMoon(); } catch { }
+                    try { enemies.ClearDarkness(); } catch { }
+                    try
+                    {
+                        Kingdom kingdom = managers.kingdom;
+                        if (kingdom != null) kingdom.CheckBecomeSafe();
+                    }
+                    catch { }
+                    _timeStuckRepairs = 1;   // 若 10 秒后时钟仍不动，下一轮再清理残留的时间停止者
+                }
+                else
+                {
+                    // 第二轮：恢复倍率后时钟依旧不走，说明导演的时间停止者列表里还留着 TimeStopper
+                    // （它会让 Director.Update 整段提前返回）。只从列表注销，不销毁/禁用视觉对象。
+                    try
+                    {
+                        var stoppers = director._timeStoppers;
+                        if (stoppers != null && stoppers.Count > 0)
+                        {
+                            for (int i = stoppers.Count - 1; i >= 0; i--)
+                            {
+                                TimeStopper stopper = stoppers[i];
+                                if (stopper == null) continue;
+                                try { director.RemoveTimeStopper(stopper); } catch { }
+                            }
+                        }
+                    }
+                    catch { }
+                    _timeStuckRepairs = 0;
+                }
+                _timeStuckSince = -1f;
             }
             catch { }
         }
