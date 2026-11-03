@@ -22,9 +22,9 @@ namespace BetterKingdom
         private const int PurseMaxCoins = 38;        // 钱袋容量上限（钻石占 3 金币位，有效金币上限 = 38 - 3×钻石数）
         private const float PayHoldThreshold = 0.4f; // 长按判定阈值（秒），短点击不触发取款
         private const int PortalSideWorkerLimit = 2; // 传送门被摧毁后该侧保留的工人数
-        private const float SafeCheckInterval = 2f;     // 白天安全态兜底检查间隔
         private const float SafeDistance = 20f;         // 避险安全距离：工人位置距该侧城墙外沿（无墙时距主城）超过此值且该侧有怪物出击，就跑回城墙
-        private const float ForcedSafeCooldown = 15f;   // 强制安全转换的最小间隔（转换会重跑整套分配流程，不能高频触发）
+        private const float PlayerRunSpeedCap = 5.8f;   // 玩家奔跑最高速度：原版约 4.29，这里提升到 5.8
+        private const float PlayerRunSpeedGuard = 4f;   // 判定“正在奔跑”的下限（行走速度远低于此，不会误伤）
 
         private Player _cachedPlayer;
         private Player _cachedPlayer2;
@@ -34,9 +34,7 @@ namespace BetterKingdom
         private float _payHoldStartP1 = -1f, _payHoldStartP2 = -1f;
         private float _nextCacheRefresh, _nextHeavyWork, _nextPortalCheck, _nextWallQueueClamp;
         private static float _nextCaveScan;  // 兜底场景搜索洞窟的节流时间
-        private static float _nextSafeCheck, _nextForcedSafe;  // 安全态兜底检查与强制转换的节流时间
         private static int _cachedKingdomId = -1;             // 用于检测换岛（Kingdom 实例变化）
-        private static bool _wasNight;                        // 上一轮昼夜判定（用于捕捉入夜瞬间）
         private static float _nextTimePauseCheck;             // 时间停滞检测节流时间
         private static float _lastDirectorTime = -1f;         // 上次采样到的游戏时刻（判断时钟是否真的不走）
         private static float _timeStuckSince = -1f;           // 时钟连续停滞的起点（-1 表示时钟正常）
@@ -57,7 +55,7 @@ namespace BetterKingdom
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _suspendWorkerBuffer;
         // 该侧出现进攻怪物时被暂时撤下的“排队工作”（还没开始做）：怪物归零后立即还给原工人。
         // 只撤排队工作、不撤 _currentWork——正在干的活按原生逻辑干完再避险。
-        private struct SuspendedJob { public Worker Worker; public Workable Job; public Side Side; }
+        private struct SuspendedJob { public Worker Worker; public Workable Job; }
         private static readonly List<SuspendedJob> _suspendedJobs = new List<SuspendedJob>();
         // 周期性遍历复用缓冲：修正流程每 2 秒执行一次，反复分配 IL2CPP 数组会造成 GC 尖峰与掉帧
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer> _archerBuffer;
@@ -70,23 +68,33 @@ namespace BetterKingdom
         private static bool _chargePickActive;          // 处于 PayableBorder.Pay 执行期间
         private static bool _chargePicking;             // 正在计算最佳小队（绕过 CanCharge 过滤）
 
-        private static int _safeLastKingdomId = -1;     // 安全态兜底记录的 Kingdom 实例ID（换岛时重置节流）
+        // 全局重型刷新槽位：本组件与地图覆盖层的周期刷新共用，同一帧只允许一个重型任务执行，
+        // 其余顺延到后续帧，避免多个全场景扫描/遍历叠在同一帧形成帧尖峰
+        private static int _heavySlotFrame = -1;
 
-        /// <summary>当前实例（供 Harmony 补丁在传送门摧毁时立即触发检查）。</summary>
-        public static FeatureBehaviour Instance { get; private set; }
+        /// <summary>
+        /// 申请本帧唯一的重型刷新槽位。返回 false 表示本帧已有其它重型任务在执行，
+        /// 调用方不要重置自己的计时器，顺延到下一帧即可（各任务周期远大于一帧，不会饿死）。
+        /// </summary>
+        public static bool TryReserveHeavySlot()
+        {
+            int frame = Time.frameCount;
+            if (frame == _heavySlotFrame) return false;
+            _heavySlotFrame = frame;
+            return true;
+        }
 
         private void Awake()
         {
-            Instance = this;
             _lastDisableWallQueue = ModWindowBehaviour.DisableWallQueue;
-            // 错峰执行重型任务：墙体修正与传送门检查同帧触发会形成约每 2 秒一次的帧尖峰
-            _nextHeavyWork = Time.unscaledTime + 0.7f;
-            _nextPortalCheck = Time.unscaledTime + 1.4f;
-        }
-
-        private void OnDestroy()
-        {
-            if (Instance == this) Instance = null;
+            // 错峰初始化各周期任务：首帧若全部到期会连续多帧排队，这里按不同相位散开
+            float now = Time.unscaledTime;
+            _nextAssaultCheck = now;
+            _nextCacheRefresh = now + 0.1f;
+            _nextTimePauseCheck = now + 0.5f;
+            _nextWallQueueClamp = now + 0.6f;
+            _nextHeavyWork = now + 0.7f;
+            _nextPortalCheck = now + 1.4f;
         }
 
         private void Update()
@@ -99,25 +107,17 @@ namespace BetterKingdom
 
             // 墙外有进攻怪物时，工人停止接活/撤销无法安全撤离的墙外工作（不区分昼夜：
             // 传送门离城墙较远时游戏会在天黑前提前放怪）
-            if (now >= _nextAssaultCheck)
+            // 安全判定优先占用重型槽位，其余周期任务都可以顺延一帧，威胁检测不能漏
+            if (now >= _nextAssaultCheck && TryReserveHeavySlot())
             {
                 _nextAssaultCheck = now + AssaultCheckInterval;
                 RefreshSideAssault();
             }
 
-            if (now >= _nextCacheRefresh)
+            if (now >= _nextCacheRefresh && TryReserveHeavySlot())
             {
                 _nextCacheRefresh = now + CacheInterval;
                 RefreshCaches();
-            }
-
-            // 白天安全态兜底：换岛后王国偶发停在“非安全”状态，工人缩回营地、弓箭手白天不打猎
-            // 夜间反之：进入非安全态，让弓箭手上墙驻守（见 EnsureNightUnsafe）
-            if (now >= _nextSafeCheck)
-            {
-                _nextSafeCheck = now + SafeCheckInterval;
-                EnsureDaytimeSafe();
-                EnsureNightUnsafe();
             }
 
             // 血月结束后游戏可能把时钟倍率留在 0，导致时间永久停住（只有重进游戏才恢复）
@@ -129,7 +129,7 @@ namespace BetterKingdom
 
             // 禁用排队时高频复钳：游戏会在夜袭等时机经其它分配路径重新写入排队深度，
             // 只靠分配补丁与 2 秒重活会让弓箭手先短暂走回队列站位
-            if (ModWindowBehaviour.DisableWallQueue && now >= _nextWallQueueClamp)
+            if (ModWindowBehaviour.DisableWallQueue && now >= _nextWallQueueClamp && TryReserveHeavySlot())
             {
                 _nextWallQueueClamp = now + WallQueueClampInterval;
                 ClampWallQueueing();
@@ -138,13 +138,14 @@ namespace BetterKingdom
             // 钱袋国库联动（每帧：溢出即时存入，长按取款需帧级按键追踪）
             UpdatePurseTreasuryLink(now);
 
-            if (now >= _nextHeavyWork)
+            if (now >= _nextHeavyWork && TryReserveHeavySlot())
             {
                 _nextHeavyWork = now + HeavyInterval;
                 FixWallDefensePositions();
             }
 
-            if (_portalCheckRequested || now >= _nextPortalCheck)
+            // 被请求时保留标志，等拿到槽位再执行，避免请求与其它重型任务同帧叠加
+            if ((_portalCheckRequested || now >= _nextPortalCheck) && TryReserveHeavySlot())
             {
                 _portalCheckRequested = false;
                 _nextPortalCheck = now + HeavyInterval;
@@ -178,9 +179,6 @@ namespace BetterKingdom
                 float now = Time.unscaledTime;
                 _nextHeavyWork = now + 0.7f;     // 换岛后同样错峰，避免两个重型任务同帧执行
                 _nextPortalCheck = now + 1.4f;
-                _nextSafeCheck = 0f;
-                _nextForcedSafe = 0f;
-                _wasNight = false;   // 换岛后重新判定：夜间登岛时也要走一次入夜分配流程
             }
             catch { }
         }
@@ -210,6 +208,9 @@ namespace BetterKingdom
 
                 _cachedCastle = kingdom.castle;
                 TrackKingdomChange(kingdom);
+
+                // 玩家最高移速提升（功能开关）：开启时抬速并记录原始值，关闭时还原
+                SyncPlayerSpeedBoost(player, _cachedPlayer2);
             }
             catch { }
 
@@ -238,6 +239,106 @@ namespace BetterKingdom
                             catch { }
                         }
                     }
+                }
+            }
+            catch { }
+        }
+
+        // 开启移速提升前各坐骑的原始奔跑速度（关闭开关时按原值还原）
+        private struct BoostedSteed { public int Id; public Steed Steed; public float BaseRunSpeed; }
+        private static readonly List<BoostedSteed> _boostedSteeds = new List<BoostedSteed>();
+
+        /// <summary>
+        /// 按“玩家移动速度提升”开关同步移速：开启时把奔跑最高速度抬到 5.8（原版约 4.29），
+        /// 关闭时把之前改过的坐骑全部还原，保证开关即时生效。
+        /// </summary>
+        private static void SyncPlayerSpeedBoost(Player p1, Player p2)
+        {
+            if (ModWindowBehaviour.BoostPlayerSpeed)
+            {
+                BoostPlayerRunSpeed(p1);
+                BoostPlayerRunSpeed(p2);
+                return;
+            }
+            if (_boostedSteeds.Count == 0) return;
+
+            // 正在奔跑的目标速度也退回原值（只认我们写入的精确值，避免误伤冲刺等更高速度）
+            RestorePlayerMoverSpeed(p1);
+            RestorePlayerMoverSpeed(p2);
+            for (int i = 0; i < _boostedSteeds.Count; i++)
+            {
+                try { if (_boostedSteeds[i].Steed != null) _boostedSteeds[i].Steed.runSpeed = _boostedSteeds[i].BaseRunSpeed; } catch { }
+            }
+            _boostedSteeds.Clear();
+        }
+
+        /// <summary>
+        /// 把玩家的奔跑最高速度提升到 PlayerRunSpeedCap：
+        /// 直接改坐骑的 runSpeed，让游戏下一次进入奔跑时按新速度走；
+        /// 同时把当前已生效的移动目标速度抬到目标值，避免正在奔跑的这一段仍停留在旧速度。
+        /// 只处理 [Guard, Cap) 区间——行走速度远低于 4，冲刺/特殊加速高于 Cap 的一律不动。
+        /// </summary>
+        private static void BoostPlayerRunSpeed(Player player)
+        {
+            if (player == null) return;
+            try
+            {
+                Steed steed = player.steed;
+                if (steed != null)
+                {
+                    float speed = steed.runSpeed;
+                    if (speed < PlayerRunSpeedCap)
+                    {
+                        RememberSteedBaseSpeed(steed, speed);   // 只记录第一次的原值
+                        steed.runSpeed = PlayerRunSpeedCap;
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                Mover mover = player.mover;
+                if (mover != null)
+                {
+                    float speed = mover._moveSpeed;
+                    if (speed >= PlayerRunSpeedGuard && speed < PlayerRunSpeedCap)
+                        mover._moveSpeed = PlayerRunSpeedCap;
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>记录坐骑被改动前的原始奔跑速度（同一坐骑只记一次）。</summary>
+        private static void RememberSteedBaseSpeed(Steed steed, float baseSpeed)
+        {
+            try
+            {
+                int id = steed.GetInstanceID();
+                for (int i = 0; i < _boostedSteeds.Count; i++)
+                    if (_boostedSteeds[i].Id == id) return;
+                if (_boostedSteeds.Count >= 8) return;   // 正常只会接触几匹马，上限防止列表无限增长
+                _boostedSteeds.Add(new BoostedSteed { Id = id, Steed = steed, BaseRunSpeed = baseSpeed });
+            }
+            catch { }
+        }
+
+        /// <summary>关闭开关时把玩家当前奔跑目标速度退回该坐骑的原始值。</summary>
+        private static void RestorePlayerMoverSpeed(Player player)
+        {
+            if (player == null) return;
+            try
+            {
+                Steed steed = player.steed;
+                Mover mover = player.mover;
+                if (steed == null || mover == null) return;
+                if (mover._moveSpeed < PlayerRunSpeedCap - 0.05f) return;   // 不是我们写入的高值
+                int id = steed.GetInstanceID();
+                for (int i = 0; i < _boostedSteeds.Count; i++)
+                {
+                    if (_boostedSteeds[i].Id != id) continue;
+                    if (mover._moveSpeed <= PlayerRunSpeedCap + 0.05f)
+                        mover._moveSpeed = _boostedSteeds[i].BaseRunSpeed;
+                    return;
                 }
             }
             catch { }
@@ -349,118 +450,6 @@ namespace BetterKingdom
 
                 FixGuardSlotsInsideWalls(kingdom, castleX);
                 FixArchersInsideWalls(kingdom, castleX);
-            }
-            catch { }
-        }
-
-        // ==================== 白天安全态兜底 ====================
-
-        /// <summary>
-        /// 白天兜底让王国进入“安全”状态。
-        /// 已确认的游戏逻辑：Worker.ShouldShelter 在 Kingdom.isSafe 为假时返回真（工人缩回营地、不接活），
-        /// Archer.ShouldHunt 在 Kingdom.isSafe 为假时直接返回假（白天不出去打猎）。
-        /// 正常情况下由 Kingdom.Update 每帧调用 CheckBecomeSafe 完成“白天 + 无危险”的安全转换，
-        /// 但换岛后该转换偶发失灵（isSafe 一直停在 false），表现就是工人与弓箭手都停在营地附近无行为。
-        /// BecomeSafe 自身只要求当前“非安全”，不检查昼夜与危险，所以这里先自行确认
-        /// “白天 + EnemyManager.IsDangerous 为假”再调用，避免夜间或怪物进攻时错误放工人出城。
-        /// </summary>
-        private static void EnsureDaytimeSafe()
-        {
-            try
-            {
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                if (managers == null) return;
-                Director director = managers.director;
-                if (director == null || !director.IsDaytime) return;
-                Kingdom kingdom = managers.kingdom;
-                if (kingdom == null) return;
-
-                // 换岛后 Kingdom 是全新实例：重置强制转换的节流，让安全态立即重新评估
-                int kid;
-                try { kid = kingdom.GetInstanceID(); } catch { kid = _safeLastKingdomId; }
-                if (kid != _safeLastKingdomId)
-                {
-                    _safeLastKingdomId = kid;
-                    _nextForcedSafe = 0f;
-                }
-
-                bool safe;
-                try { safe = kingdom.isSafe; } catch { return; }
-                if (safe) return;
-
-                // 红月/黑暗（攻破传送门后的复仇波次）期间绝不能强制转安全：
-                // 游戏原生收尾 EnemyManager.CheckDanger 只在 kingdom.isSafe 为假时才会执行
-                // ResumeTime + ClearRedMoon/ClearDarkness。若先把王国转成安全态，收尾分支被永久跳过，
-                // 表现就是复仇怪物清完后单位行为恢复、但时钟与画面一直卡在血月进攻状态（只有重进游戏才恢复）
-                bool eventOngoing;
-                try
-                {
-                    EnemyManager em = managers.enemies;
-                    eventOngoing = em != null && (em.isRedMoon || em.isDarkness);
-                }
-                catch { eventOngoing = false; }
-                if (eventOngoing) return;
-
-                // 以“本侧实际还有出击怪物”为准：EnemyManager 的危险计数（_enemiesAttacking /
-                // _retaliationsQueued）在换岛后可能残留，若拿它当判据，白天会永远进不了安全态
-                if (IsSideUnderAttack(Side.Left) || IsSideUnderAttack(Side.Right)) return;
-
-                // BecomeSafe 会重跑农场/觅食/捕鱼/弓箭手整套分配流程，开销不小；
-                // 若 isSafe 因其它原因反复翻回 false，这里限频，避免每 2 秒触发一次造成画面卡顿
-                float now = Time.unscaledTime;
-                if (now < _nextForcedSafe) return;
-                _nextForcedSafe = now + ForcedSafeCooldown;
-                try { kingdom.BecomeSafe(); } catch { }
-            }
-            catch { }
-        }
-
-        /// <summary>
-        /// 夜间兜底转入“非安全”状态。
-        /// 已确认的游戏逻辑：Archer.ShouldGoToWall 在 Kingdom.isSafe 为真时不会强制上墙，
-        /// Archer.ShouldHunt 在 isSafe 为真时会继续打猎。游戏只在真正检测到危险时调用 BecomeUnsafe，
-        /// 换岛/平静的第一夜没有触发，于是弓箭手整夜在外打猎，直到怪物逼近才被驱赶回墙内。
-        /// 这里在夜间主动调用 BecomeUnsafe：它只做守墙/长矛手重分配（DistributeTowerArchers /
-        /// DistributeFreeArchers / DistributePikemen），天亮后由 EnsureDaytimeSafe 转回安全，
-        /// 与游戏原生昼夜循环一致。夜间已处于非安全（真有进攻）时不做任何事。
-        /// </summary>
-        private static void EnsureNightUnsafe()
-        {
-            try
-            {
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                if (managers == null) return;
-                Director director = managers.director;
-                if (director == null) return;
-                bool night = !director.IsDaytime;
-
-                // 入夜瞬间：完整复刻 Kingdom.Update 的原生入夜分支（转非安全 + 重分守墙位）。
-                // 换岛（尤其夜间登岛）后 Kingdom 内部的昼夜标记可能已与当前时间不一致，
-                // Update 会因“标记未翻转”跳过整段入夜逻辑，导致首夜弓箭手继续在外打猎。
-                if (night && !_wasNight)
-                {
-                    Kingdom k = managers.kingdom;
-                    if (k != null)
-                    {
-                        try { k.isSafe = false; } catch { }
-                        try { k.DistributeTowerArchers(); } catch { }
-                        try { k.DistributeFreeArchers(); } catch { }
-                        try { k.DistributePikemenForSide(Side.Left); } catch { }
-                        try { k.DistributePikemenForSide(Side.Right); } catch { }
-                    }
-                }
-                _wasNight = night;
-                if (!night) return;
-
-                Kingdom kingdom = managers.kingdom;
-                if (kingdom == null) return;
-                bool safe;
-                try { safe = kingdom.isSafe; } catch { return; }
-                if (!safe) return;                                    // 已是非安全：原生判断已生效
-                try { kingdom.BecomeUnsafe(); } catch { }
-                // BecomeUnsafe 末尾会调用一个外部对象，换岛后该对象可能缺失而抛异常；
-                // 此时直接改写安全标记兜底，保证 ShouldHunt/ShouldGoToWall 的原生判断回到“非安全”分支
-                try { if (kingdom.isSafe) kingdom.isSafe = false; } catch { }
             }
             catch { }
         }
@@ -1077,8 +1066,7 @@ namespace BetterKingdom
 
             // 无论是否检测到怪物都要走到这里：怪物刚出时就撤下还没开始的排队工作（不再被派出去），
             // 怪物归零后立即把工作还回去（游戏夜间不会重分配，只能靠这里）
-            SuspendUnsafeQueuedWork(Side.Left);
-            SuspendUnsafeQueuedWork(Side.Right);
+            SuspendUnsafeQueuedWork();
             ResumeSuspendedWork();
 
             // 某侧进攻怪物刚归零：立即让游戏重新分配工作。
@@ -1097,14 +1085,16 @@ namespace BetterKingdom
         }
 
         /// <summary>
-        /// 该侧有进攻怪物时，撤下工人“已经分配但还没开始”的工作（_queuedWork）。
+        /// 撤下工人“已经分配但还没开始”的不安全墙外工作（_queuedWork）。
         /// 这是工人仍会跑去工作的根源：工作往往在怪物出现之前就已分配好，AssignJob 拦截管不到，
         /// 而 Work 状态优先级高于 Shelter，工人会一路走到危险区。
+        /// 判定只看工作点本身（工作点所属侧是否被进攻、工作点是否在安全距离外），
+        /// 与接活工人此时在哪一侧无关：左侧出怪时，右侧工人手里那份左侧危险工作同样会被撤下。
         /// 正在做的工作（_currentWork）不动：按原生逻辑干完手上的活，之后再进入避险回城。
         /// </summary>
-        private static void SuspendUnsafeQueuedWork(Side side)
+        private static void SuspendUnsafeQueuedWork()
         {
-            if (!IsSideUnderAttack(side)) return;
+            if (!_attackOnLeft && !_attackOnRight) return;
             try
             {
                 Managers managers = SingletonMonoBehaviour<Managers>.Inst;
@@ -1127,16 +1117,64 @@ namespace BetterKingdom
                     if (job == null) continue;
                     float x;
                     if (!TryGetX(job, out x)) continue;
-                    if (IsPositionSafe(kingdom, x, SideFromX(kingdom, x))) continue;   // 工作点在安全范围内，照常去干
+                    if (IsWorkSpotSafe(kingdom, x)) continue;   // 工作点在安全范围内，照常去干
 
                     // 走游戏自己的取消流程释放工作位占用，否则之后同类工作不会再被分配
                     try { job.CancelWork(w); } catch { }
                     try { if (w._queuedWork == job) w._queuedWork = null; } catch { }
                     if (_suspendedJobs.Count < 64)
-                        _suspendedJobs.Add(new SuspendedJob { Worker = w, Job = job, Side = side });
+                        _suspendedJobs.Add(new SuspendedJob { Worker = w, Job = job });
                 }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 撤销某个工人手上“已分配但还没开始”的不安全工作，并清掉强制工作标记。
+        /// 游戏还有绕过 AssignJob 的分配路径（例如付费接活：IUnitControllable.UpdatePayState 直接写 _queuedWork），
+        /// 补丁在那些动作结束后立刻调用本方法，保证进攻期间危险工作点不会被任何人接下。
+        /// </summary>
+        public static bool CancelUnsafeQueuedWork(Worker worker)
+        {
+            if (worker == null) return false;
+            try
+            {
+                Workable job = worker._queuedWork;
+                if (job == null) return false;
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return false;
+                float x;
+                if (!TryGetX(job, out x)) return false;
+                if (IsWorkSpotSafe(kingdom, x)) return false;   // 工作点在安全范围内，照常去干
+
+                try { job.CancelWork(worker); } catch { }
+                try { if (worker._queuedWork == job) worker._queuedWork = null; } catch { }
+                try { worker._forceWork = false; } catch { }   // 付费接活会置强制工作标志，撤销时一并清掉
+                return true;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// 某份工作此刻能不能被工人真正开始干：进攻怪物在该工作点所属侧且超出安全距离时一律不行。
+        /// 供 Worker.SetCurrentWork 补丁作为最后一道防线（所有把排队工作转成当前工作的路径都经过它）。
+        /// </summary>
+        public static bool CanStartWork(Workable job)
+        {
+            if (job == null) return true;
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return true;
+                float x;
+                if (!TryGetX(job, out x)) return true;
+                return IsWorkSpotSafe(kingdom, x);
+            }
+            catch { }
+            return true;
         }
 
         /// <summary>
@@ -1156,11 +1194,10 @@ namespace BetterKingdom
                 {
                     SuspendedJob c = _suspendedJobs[i];
                     if (c.Worker == null || c.Job == null) { _suspendedJobs.RemoveAt(i); continue; }
-                    if (IsSideUnderAttack(c.Side)) continue;   // 该侧还有进攻怪物，继续避险
 
                     float x;
                     if (!TryGetX(c.Job, out x)) { _suspendedJobs.RemoveAt(i); continue; }
-                    if (!IsPositionSafe(kingdom, x, SideFromX(kingdom, x))) continue;   // 工作点仍不安全，等待
+                    if (!IsWorkSpotSafe(kingdom, x)) continue;   // 工作点所属侧仍有进攻怪物或在安全距离外，继续等待
 
                     bool busy;
                     try { busy = c.Worker._queuedWork != null || c.Worker._currentWork != null; }
@@ -1298,7 +1335,7 @@ namespace BetterKingdom
                 if (kingdom == null) return false;
                 float x;
                 if (!TryGetX(w, out x)) return false;
-                return !IsPositionSafe(kingdom, x, SideFromX(kingdom, x));
+                return !IsPositionSafe(kingdom, x, AttackSideFromX(kingdom, x));
             }
             catch { }
             return false;
@@ -1326,6 +1363,30 @@ namespace BetterKingdom
             }
             catch { }
             return false;
+        }
+
+        /// <summary>
+        /// 统一的工作点安全判定：以“工作点所属侧”为准，判断该工作点此刻能不能被任何人接受。
+        /// 只要该侧有进攻怪物、工作点在墙外且超出安全距离，就返回 false——与接活工人当前在哪一侧无关。
+        /// AssignJob 拦截、排队工作撤下/还回全部走这一条判据，避免两侧口径不一致。
+        /// </summary>
+        public static bool IsWorkSpotSafe(Kingdom kingdom, float x)
+        {
+            if (kingdom == null) return true;
+            return IsPositionSafe(kingdom, x, AttackSideFromX(kingdom, x));
+        }
+
+        /// <summary>
+        /// 按主城（城堡）位置把坐标分到左右侧——与怪物分侧口径完全一致。
+        /// 以前工作点用露营火堆分侧、怪物用城堡分侧，两者位置略有差异时边界附近的工作会被判到另一侧。
+        /// 取不到城堡位置时退回露营火堆位置兜底。
+        /// </summary>
+        private static Side AttackSideFromX(Kingdom kingdom, float x)
+        {
+            float divider;
+            if (TryGetX(kingdom != null ? kingdom.castle : null, out divider))
+                return x < divider ? Side.Left : Side.Right;
+            return SideFromX(kingdom, x);
         }
 
         /// <summary>
@@ -1565,7 +1626,8 @@ namespace BetterKingdom
     }
 
     /// <summary>
-    /// 该侧有怪物出击时拒绝新的危险工作：不让工人接安全距离外的墙外任务跑出去。
+    /// 拒绝不安全的墙外工作：该工作点所属侧有怪物出击、且工作点超出安全距离时，不论哪个工人来接手一律拒绝，
+    /// 直到该侧进攻怪物归零。判定只看工作点，不看工人当前在哪一侧——左侧出怪时右侧工人也不能接左侧危险活。
     /// 已经在做的活不受影响（Work 优先级高于 Shelter，干完后由 ShouldShelter 补丁带回城墙），
     /// 与“不干预工作行为”一致；该侧无怪物、工作点墙内或安全距离内一律放行。
     /// </summary>
@@ -1574,18 +1636,40 @@ namespace BetterKingdom
     {
         public static bool Prefix(Workable job)
         {
-            try
-            {
-                if (job == null) return true;
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Kingdom kingdom = managers != null ? managers.kingdom : null;
-                if (kingdom == null) return true;
-                float x;
-                try { x = job.transform.position.x; } catch { return true; }   // 取不到位置时不干预
-                return FeatureBehaviour.IsPositionSafe(kingdom, x, FeatureBehaviour.SideFromX(kingdom, x));
-            }
-            catch { }
-            return true;
+            return FeatureBehaviour.CanStartWork(job);
+        }
+    }
+
+    /// <summary>
+    /// 最后一道防线：任何把排队工作转成“当前工作”的路径（包括绕过 AssignJob 的付费接活）都会被拦下。
+    /// Worker.Behaviour 协程里 SetCurrentWork(_queuedWork) 是唯一的转换漏斗，工作点在进攻侧安全距离外时
+    /// 拒绝启动并释放工作位；传 null 的调用（清空工作）一律放行。
+    /// </summary>
+    [HarmonyPatch(typeof(Worker), nameof(Worker.SetCurrentWork))]
+    public static class WorkerSetCurrentWorkSafePatch
+    {
+        public static bool Prefix(Worker __instance, Workable __0)
+        {
+            if (__0 == null) return true;
+            if (FeatureBehaviour.CanStartWork(__0)) return true;
+            try { __0.CancelWork(__instance); } catch { }   // 释放工作位，避免之后同类工作再也分配不出去
+            try { if (__instance != null && __instance._queuedWork == __0) __instance._queuedWork = null; } catch { }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 付费接活路径：Worker 实现 IUnitControllable 的 UpdatePayState 在玩家长按支付时，
+    /// 会把付费范围内的 Workable 直接写进 _queuedWork 并置强制工作标志，完全绕过 AssignJob。
+    /// 这里在方法结束后立刻复查，工作点在进攻侧安全距离外时立即撤销，避免工人被派去危险区域。
+    /// 注意 interop 里显式接口方法名为下划线形式（IUnitControllable_UpdatePayState）。
+    /// </summary>
+    [HarmonyPatch(typeof(Worker), nameof(Worker.IUnitControllable_UpdatePayState))]
+    public static class WorkerPayWorkSafePatch
+    {
+        public static void Postfix(Worker __instance)
+        {
+            FeatureBehaviour.CancelUnsafeQueuedWork(__instance);
         }
     }
 

@@ -153,9 +153,10 @@ namespace BetterKingdom
         public static bool ShowTimeSeason;    // 时间与当前季节天数显示
         public static bool BellInstantBoard;  // 摇铃后被召唤的职业立即传送上船（省去跑动，不影响玩家）
         public static bool DisableWallQueue;  // 禁用排队机制（开启后守墙弓箭手与骑士不再沿墙后排长队，统一站在墙后可射击的距离内）
+        public static bool BoostPlayerSpeed; // 玩家移动速度提升（奔跑最高速度由原版约 4.3 提升到 6.3，行走速度不变）
 
         // ---- 持久化配置项（Plugin.Load 时绑定并读取；ConfigEntry 赋值即自动写盘） ----
-        private static ConfigEntry<bool> _cfgAllDefenses, _cfgOnlyBuilt, _cfgCamps, _cfgStatues, _cfgMounts, _cfgGreedHealth, _cfgCropProgress, _cfgPurseLink, _cfgChests, _cfgTechPoints, _cfgTeleporters, _cfgMap, _cfgMapEnemies, _cfgClassStats, _cfgCoins, _cfgTimeSeason, _cfgBellInstant, _cfgDisableWallQueue;
+        private static ConfigEntry<bool> _cfgAllDefenses, _cfgOnlyBuilt, _cfgCamps, _cfgStatues, _cfgMounts, _cfgGreedHealth, _cfgCropProgress, _cfgPurseLink, _cfgChests, _cfgTechPoints, _cfgTeleporters, _cfgMap, _cfgMapEnemies, _cfgClassStats, _cfgCoins, _cfgTimeSeason, _cfgBellInstant, _cfgDisableWallQueue, _cfgPlayerSpeed;
 
         /// <summary>绑定并读取持久化配置，使退出游戏后再次进入时恢复上次的开关设置。</summary>
         public static void InitConfig(ConfigFile config)
@@ -180,6 +181,7 @@ namespace BetterKingdom
             _cfgPurseLink = config.Bind("功能设置", "钱袋与国库共通", false, "钱袋金币数过多时将多余金币自动存入国库；钱袋为空时长按支付键可从国库中取出金币填满钱袋");
             _cfgBellInstant = config.Bind("功能设置", "摇铃后NPC立即上船", false, "");
             _cfgDisableWallQueue = config.Bind("功能设置", "禁用排队机制", false, "");
+            _cfgPlayerSpeed = config.Bind("功能设置", "增加奔跑速度", false, "");
             ShowAllDefenses = _cfgAllDefenses.Value;
             ShowOnlyBuiltDefenses = _cfgOnlyBuilt.Value;
             ShowAllCamps = _cfgCamps.Value;
@@ -198,6 +200,7 @@ namespace BetterKingdom
             ShowTimeSeason = _cfgTimeSeason.Value;
             BellInstantBoard = _cfgBellInstant.Value;
             DisableWallQueue = _cfgDisableWallQueue.Value;
+            BoostPlayerSpeed = _cfgPlayerSpeed.Value;
             HotkeyBindings.InitConfig(config);
         }
 
@@ -231,6 +234,7 @@ namespace BetterKingdom
             _cfgTimeSeason.Value = ShowTimeSeason;
             _cfgBellInstant.Value = BellInstantBoard;
             _cfgDisableWallQueue.Value = DisableWallQueue;
+            _cfgPlayerSpeed.Value = BoostPlayerSpeed;
         }
 
         /// <summary>开关项视觉引用（恢复默认时统一刷新颜色）。</summary>
@@ -546,9 +550,9 @@ namespace BetterKingdom
                 // ---- 分页内容区（页签栏底条下方至面板内底缘，三页叠放按页切换；按钮已移至底边框栏） ----
                 float pageTop = TabBarTopOffset + TabBarHeight + TabBarBgPad + 6f;   // 避开底条底缘
                 float pageBottom = 14f;
-                _page1 = BuildPage(panelGo.transform, null, gameFont, pageTop, pageBottom);
-                _page2 = BuildPage(panelGo.transform, null, gameFont, pageTop, pageBottom);
-                _page3 = BuildPage(panelGo.transform, null, gameFont, pageTop, pageBottom);
+                _page1 = BuildPage(panelGo.transform, pageTop, pageBottom);
+                _page2 = BuildPage(panelGo.transform, pageTop, pageBottom);
+                _page3 = BuildPage(panelGo.transform, pageTop, pageBottom);
                 _buttonTemplate = srcButton;   // 留存模板：等待输入界面动态建确定/取消按钮用
 
                 // ---- 快捷键设置页内容：可滚动视图 + 打开窗口键行 + 玩家 1 / 玩家 2 各 5 个游戏按键行，
@@ -605,8 +609,8 @@ namespace BetterKingdom
                     () => ShowCropProgress, v => ShowCropProgress = v);
                 _displayToggleCount = _toggles.Count;   // 显示页开关构建完毕，之后进入功能页
 
-                // ---- 功能设置页内容：可滚动视图 + 三个开关行（行样式与显示页完全一致） ----
-                float funcContentHeight = 28f + 3 * ToggleRowHeight + 2 * ToggleRowGap;
+                // ---- 功能设置页内容：可滚动视图 + 四个开关行（行样式与显示页完全一致） ----
+                float funcContentHeight = 28f + 4 * ToggleRowHeight + 3 * ToggleRowGap;
                 _funcScrollRect = CreateScrollContent(_page2.transform, funcContentHeight, out RectTransform funcContentRt);
                 BuildToggleRow(funcContentRt, srcButton, "钱袋与国库共通", ConfigDesc(_cfgPurseLink), 0, gameFont,
                     () => LinkPurseTreasury, v => LinkPurseTreasury = v);
@@ -614,6 +618,8 @@ namespace BetterKingdom
                     () => BellInstantBoard, v => BellInstantBoard = v);
                 BuildToggleRow(funcContentRt, srcButton, "禁用排队机制", ConfigDesc(_cfgDisableWallQueue), 2, gameFont,
                     () => DisableWallQueue, v => DisableWallQueue = v);
+                BuildToggleRow(funcContentRt, srcButton, "玩家移动速度提升", ConfigDesc(_cfgPlayerSpeed), 3, gameFont,
+                    () => BoostPlayerSpeed, v => BoostPlayerSpeed = v);
                 Sprite sbSprite = srcButton.image != null ? srcButton.image.sprite : null;
                 _toggleScrollbarGo = AttachScrollbar(panelGo.transform, _scrollRect, sbSprite);
                 _funcScrollbarGo = AttachScrollbar(panelGo.transform, _funcScrollRect, sbSprite);
@@ -794,18 +800,16 @@ namespace BetterKingdom
             return tab;
         }
 
-        /// <summary>构建一个分页内容区（placeholder 非空时显示全填充占位文本，随 ShowPage 切换显隐）。</summary>
-        private GameObject BuildPage(Transform parent, string placeholder, Font uiFont, float topOffset, float bottomOffset)
+        /// <summary>构建一个分页内容区（随 ShowPage 切换显隐）。</summary>
+        private GameObject BuildPage(Transform parent, float topOffset, float bottomOffset)
         {
-            var pageGo = new GameObject("Page_" + (placeholder ?? "Content"));
+            var pageGo = new GameObject("Page");
             var pageRt = pageGo.AddComponent<RectTransform>();
             pageGo.transform.SetParent(parent, false);
             pageRt.anchorMin = Vector2.zero;
             pageRt.anchorMax = Vector2.one;
             pageRt.offsetMin = new Vector2(0f, bottomOffset);   // 左右无内缩（选项边框与内窗口左右相接）
             pageRt.offsetMax = new Vector2(0f, -topOffset);
-            if (placeholder != null)
-                CreateLabel(pageGo.transform, placeholder, uiFont, 28, new Color(1f, 1f, 1f, 0.85f));
             return pageGo;
         }
 
@@ -1378,7 +1382,7 @@ namespace BetterKingdom
             }
             else if (_pageIndex == 1)
             {
-                LinkPurseTreasury = BellInstantBoard = DisableWallQueue = false;
+                LinkPurseTreasury = BellInstantBoard = DisableWallQueue = BoostPlayerSpeed = false;
                 for (int i = _displayToggleCount; i < _toggles.Count; i++)
                     if (_toggles[i].Fill != null) _toggles[i].Fill.color = ToggleOffColor;
                 SaveSettings();

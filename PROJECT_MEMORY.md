@@ -108,8 +108,11 @@
    进攻判据：`!Enemy.IsDespawning && !Enemy.shouldRetreat && !damageable.isDead && gameObject.activeSelf && Enemy.loot == null`（`loot` 非空＝已拖着金币/战利品撤回传送门）；`Enemy` 无侧别字段，用 x 与 `kingdom.castle` 的 x 比较分侧，检测结果缓存 0.2s（`RefreshSideAssault`）。
    安全距离：墙内始终安全；墙外要求距该侧城墙外沿 ≤ `SafeDistance`（20）；该侧还没有城墙时从主城（`kingdom.castle`）位置起算（`TryGetOuterWallX` 里已处理）。
    实现只用 `Worker.ShouldShelter` 的 Postfix 强制返回真：原生实现首行是 `if (kingdom.isSafe) return false`，白天会被游戏的安全态按掉，所以才需要补丁。判据 `ShouldFleeToWall` 只看工人自身位置。
-   **让工人不出去**：①`Worker.AssignJob(Workable)` Prefix 拒绝该侧有怪时“安全距离外”的新工作（`WorkerAssignSafeJobPatch`）；②`SuspendUnsafeQueuedWork` 撤销**已分配但还没开始**的 `_queuedWork`——工作往往在怪物出现前就分配好了，Prefix 管不到，所以这是“工人仍跑去工作”的真正原因；③**不撤 `_currentWork`**：正在干的活按原生优先级（Work > Shelter）干完再回城（`CancelWork`/`ResetWorkState` 打断工作会引发恢复难题）。
-   **让工人回来干活**：`ResumeSuspendedWork` 在该侧进攻怪归零后立刻 `AssignJob` 还回被撤下的工作；`JobAvailable()` 为假时保留记录下次重试，工人已有活则丢弃记录。
+   **统一判据（按工作点，不按工人所在侧）**：`IsWorkSpotSafe(kingdom, x)` 先用 x 与 `kingdom.castle` 的 x 分侧（与怪物分侧口径一致，取不到城堡时退回露营火堆位置），再走 `IsPositionSafe`。该侧有怪且工作点在安全距离外即为不安全，**任何人都不许接**。
+   ①`Worker.AssignJob(Workable)` Prefix 一律拒绝不安全工作点（`WorkerAssignSafeJobPatch`）——左侧出怪时，右侧工人也接不到左侧的危险活；②`SuspendUnsafeQueuedWork` 遍历 `kingdom.Workers` 撤下所有**已分配但还没开始**的不安全 `_queuedWork`（不再按侧分流，与 Prefix 同一判据，工作往往在怪物出现前就已分配好，Prefix 管不到）；③**不撤 `_currentWork`**：正在干的活按原生优先级（Work > Shelter）干完再回城（`CancelWork`/`ResetWorkState` 打断工作会引发恢复难题）。
+   **绕过 AssignJob 的付费接活路径（补丁 ④⑤，2026-11-02 补）**：`Worker` 实现 `IUnitControllable.UpdatePayState`（interop 名 `IUnitControllable_UpdatePayState`，IL 中 `[this+200]=workable; [this+386]=1`）——玩家长按支付时把 `_maxWorkDistance` 内**任意** `Kingdom.GetTotalWork()` 工作直接写进 `_queuedWork` 并置 `__forceWork`（属性名 `_forceWork`），完全跳过 `AssignJob`；`Worker.Behaviour` 协程随后按 `_queuedWork` 的坐标 `Mover.SetGoal` 走过去，再在 IL 745 调 `SetCurrentWork(_queuedWork)` 转成当前工作（这是所有排队工作转当前工作的唯一漏斗）。
+   ④`WorkerPayWorkSafePatch`：`IUnitControllable_UpdatePayState` Postfix 调 `FeatureBehaviour.CancelUnsafeQueuedWork`（撤销不安全 `_queuedWork`、`CancelWork` 释放工作位、清 `_forceWork`），分配动作结束的同一帧就撤掉；⑤`WorkerSetCurrentWorkSafePatch`：`Worker.SetCurrentWork` Prefix 用 `CanStartWork` 拒绝在危险工作点启动（null 放行），是覆盖所有路径的最后防线。`CanStartWork` / `CancelUnsafeQueuedWork` 与 `AssignJob` 拦截共用 `IsWorkSpotSafe` 判据。
+   **让工人回来干活**：`ResumeSuspendedWork` 在工作点重新变安全（该侧进攻怪归零）后立刻 `AssignJob` 还回被撤下的工作；`JobAvailable()` 为假时保留记录下次重试，工人已有活则丢弃记录；`SuspendedJob` 不记录侧别，恢复时全部按工作点重算。
    光还回记录还不够：游戏原生只在 `Director.IsDaytime` 时由 `Worker+<Behaviour>d__111::MoveNext` 调 `Kingdom.ReassignWork`（IL 356-371：`Kingdom.WorkAvailable() && Director.get_IsDaytime()`），**夜间根本不分配新工作**。所以在 `RefreshSideAssault` 里检测 `_attackOnLeft/_attackOnRight` 由真变假的那一帧，主动调用一次 `kingdom.ReassignWork()`，让夜间怪物被清掉后工人立即出门；`Kingdom.ReassignWork` 本身不检查昼夜，`Worker.ResetWorkState` 夜间也会调用。
    判据：`IsAssaultingEnemy` = `!IsDespawning && !shouldRetreat && !damageable.isDead && gameObject.activeSelf && loot == null`；`loot` 非空＝已拖着金币/战利品回传送门，不算进攻怪物（否则逃跑的怪会让工人一直不敢出门）。
    该补丁不碰 `isSafe` 与 `Director` 时钟，避免复发“复仇血月结束后时间卡死”的问题（该问题根因是白天提前 `BecomeSafe` 跳过了原生收尾分支）。
@@ -125,6 +128,19 @@
     非法侧值来源：换岛时随船（`OnDisembarkComplete → ConvertToHunter` 不清侧值）或从岛屿存档恢复的"未分配"弓箭手。
     自愈路径只有 `Kingdom.CheckBecomeSafe()` → `DistributeFreeArchers()`（清晨安全转换时按 `Archer.isAvailable` 重新分配侧与深度），
     但读档后王国若 `isSafe` 已为真，该路径会被直接跳过，非法侧值可长期保留。模组兜底：`FeatureBehaviour.FixInvalidGuardSides` 周期性给非法侧的空闲猎手按坐标相对露营火堆补合法侧、深度归 0。
+11. **回岛后滞留人员（弓箭手/工人）卡死无行为**：离开岛时没带走、留在岛上的人员，回岛（场景重新启用）时其 `OnEnable` 可能早于王国初始化完成。
+    `Worker.OnEnable` IL 64-72 / `Archer.OnEnable` IL 98-107 都是“取 `Managers.kingdom`，为空就直接 return”，
+    于是方法尾部真正干事的 `Kingdom.AddWorker`/`AddArcher` 与 `behaviour.In(...)`（重启 IHaglet 状态机）全部被跳过：
+    这些人既不在 `kingdom.Workers`/`kingdom.Archers` 里（永远拿不到工作），状态机也没启动 → 原地不动。
+12. **周期刷新不能同帧叠加**：`FeatureBehaviour` 与 `MapOverlayBehaviour` 的各周期任务（进攻检测、缓存、墙体修正、传送门工人、洞窟/油桶/农田全场景扫描、中/重刷新）
+    共用同一个“本帧唯一重型槽位” `FeatureBehaviour.TryReserveHeavySlot()`（按 `Time.frameCount` 记账）：抢不到槽位的任务**不重置计时器**，顺延到后续帧。
+    各任务周期（0.2s~10s）都远大于一帧，因此不会饿死；安全检测放在 Update 最前，优先拿槽位。
+    `Awake` 里按不同相位初始化计时器（0/0.1/0.3/0.5/0.6/0.7/1.4s），避免首帧全部到期后连续多帧排队。每帧仍照常执行的任务只有 `UpdatePurseTreasuryLink`、`SyncWallQueueSwitch`、`EnsureTimeNotStuck`（都很轻且需要帧级/秒级精度）。
+13. **玩家最高移速 6.3（功能设置页开关「玩家移动速度提升」）**：原版奔跑约 4.29（实测 4.28~4.30 浮动）。开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（4Hz）里执行：
+    ①`player.steed.runSpeed` 不足 `PlayerRunSpeedCap`(6.3) 时写 6.3，并用 `_boostedSteeds` 记录每个坐骑改动前的原值（同一坐骑只记一次）；
+    ②`player.mover._moveSpeed` 落在 [4,6.3) 时抬到 6.3（让当前正在跑的这一段立刻生效）。
+    关闭开关时按记录把 `runSpeed` 还原、并把精确等于 6.3 的 `_moveSpeed` 退回原值，无需重启游戏。
+    只用 [4,6.3) 区间，行走速度（远低于 4）与冲刺/特殊加速（高于 6.3）都不动。如需核对实际速度，临时用 `Player.currentSpeed` 观察，用完删除。
 
 ## 5. 未知字段/方法怎么查（逆向工具链）
 

@@ -234,18 +234,19 @@ namespace BetterKingdom
 
             float now = Time.unscaledTime;
 
-            // 全场景扫描彼此错峰：FindObjectsByType 会遍历整个场景，集中执行会形成每 2 秒一次的帧尖峰
-            if (now >= _nextCaveScan)
+            // 全场景扫描彼此错峰，并与功能组件的周期任务共用同一个“本帧唯一重型槽位”：
+            // FindObjectsByType 会遍历整个场景，集中执行会形成帧尖峰；抢不到槽位的任务顺延一帧再跑
+            if (now >= _nextCaveScan && FeatureBehaviour.TryReserveHeavySlot())
             {
                 _nextCaveScan = now + CaveScanInterval;
                 RefreshCavePositions();
             }
-            if (now >= _nextOilScan)
+            if (now >= _nextOilScan && FeatureBehaviour.TryReserveHeavySlot())
             {
                 _nextOilScan = now + OilScanInterval;
                 RefreshOilBarrels();
             }
-            if (now >= _nextFarmScan)
+            if (now >= _nextFarmScan && FeatureBehaviour.TryReserveHeavySlot())
             {
                 _nextFarmScan = now + FarmScanInterval;
                 RefreshFarmlandRefs();
@@ -256,12 +257,12 @@ namespace BetterKingdom
                 _nextLightRefresh = now + LightRefreshInterval;
                 RefreshLightData();
             }
-            if (now >= _nextMediumRefresh)
+            if (now >= _nextMediumRefresh && FeatureBehaviour.TryReserveHeavySlot())
             {
                 _nextMediumRefresh = now + MediumRefreshInterval;
                 RefreshMediumData();
             }
-            if (now >= _nextHeavyRefresh)
+            if (now >= _nextHeavyRefresh && FeatureBehaviour.TryReserveHeavySlot())
             {
                 _nextHeavyRefresh = now + HeavyRefreshInterval;
                 RefreshHeavyData();

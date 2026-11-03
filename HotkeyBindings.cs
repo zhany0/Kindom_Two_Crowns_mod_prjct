@@ -25,19 +25,18 @@ namespace BetterKingdom
             public string Label;              // 行显示名
             public string Desc;               // 行说明文字
             public string[] ActionNames;      // 候选 Rewired 动作名（不区分大小写）
-            public KeyCode DefaultKey;        // 默认键（回退识别 + 恢复默认）
+            public KeyCode DefaultKey;        // 默认键（判断是否改绑 + 恢复默认）
             public bool IsAxisPart;           // 是否移动轴分量（左/右移动为同一动作的两个分量）
             public Rewired.Pole Contribution; // 轴分量方向（仅 IsAxisPart 时有意义）
             public int PlayerIndex;           // 所属 Rewired 玩家（0=玩家1，1=分屏合作玩家2）
             public int ActionId = -1;         // 运行时解析出的动作 id
-            public bool ResolvedByName;       // 动作 id 是否由候选动作名直查得到（盲扫描兜底的 id 不可信，不写入 Rewired）
             public ConfigEntry<string> Entry; // 持久化（"A" / "Q+LeftShift"）
             public bool Applied;              // 已保存的键位是否已写入游戏
         }
 
         /// <summary>
         /// 游戏按键绑定表（玩家 1 的 5 项 + 分屏合作玩家 2 的 5 项）：
-        /// 候选动作名覆盖可能的命名差异；解析失败时按默认键在对应玩家的键盘映射中回退识别。
+        /// 候选动作名覆盖可能的命名差异；解析失败时留待下次重试。
         /// </summary>
         private static readonly Binding[] _gameBindings = BuildGameBindings();
 
@@ -252,9 +251,8 @@ namespace BetterKingdom
                 foreach (var b in _gameBindings)
                 {
                     if (b.ActionId < 0) ResolveActionId(b);
-                    // 只应用玩家真正改过、且按动作名可靠解析的键位：
-                    // 默认键位无需写入 Rewired；盲扫描得到的动作 id 可能是菜单导航动作，写入会覆盖方向键
-                    if (b.ActionId >= 0 && !b.Applied && b.ResolvedByName && IsCustomized(b))
+                    // 只应用玩家真正改过的键位：默认键位无需写入 Rewired
+                    if (b.ActionId >= 0 && !b.Applied && IsCustomized(b))
                     {
                         ApplyBinding(b);
                         b.Applied = true;
@@ -278,11 +276,10 @@ namespace BetterKingdom
             catch { return null; }
         }
 
-        /// <summary>解析动作 id：先按候选动作名匹配（轴类动作左/右移动同名，解析结果共享），失败则按默认键在对应玩家的键盘映射中回退识别。</summary>
+        /// <summary>解析动作 id：按候选动作名匹配（轴类动作左/右移动同名，解析结果共享）。</summary>
         private static void ResolveActionId(Binding b)
         {
-            Rewired.Player player = GetRewiredPlayer(b.PlayerIndex);
-            if (player == null) return;   // 玩家 2 需进入分屏合作模式后才存在
+            if (GetRewiredPlayer(b.PlayerIndex) == null) return;   // 玩家 2 需进入分屏合作模式后才存在
             // 按候选名直查 id（Il2Cpp 泛型集合接口无托管枚举/索引，用按名查询绕开）
             foreach (var name in b.ActionNames)
             {
@@ -290,26 +287,7 @@ namespace BetterKingdom
                 if (id >= 0)
                 {
                     b.ActionId = id;
-                    b.ResolvedByName = true;
                     break;
-                }
-            }
-            // 回退：扫描动作 id 范围，按默认键识别（游戏动作命名与候选名不符时兜底）
-            if (b.ActionId < 0)
-            {
-                for (int actionId = 0; actionId < 200; actionId++)
-                {
-                    if (Rewired.ReInput.mapping.GetAction(actionId) == null) continue;
-                    var elements = GetKeyboardElements(player, actionId);
-                    for (int j = 0; j < elements.Count; j++)
-                    {
-                        var aem = elements[j];
-                        if (aem.keyCode != b.DefaultKey) continue;
-                        if (b.IsAxisPart && aem.axisContribution != b.Contribution) continue;
-                        b.ActionId = actionId;
-                        break;
-                    }
-                    if (b.ActionId >= 0) break;
                 }
             }
         }
@@ -332,8 +310,7 @@ namespace BetterKingdom
         /// <summary>将某绑定已保存的键位应用到游戏对应玩家（改键/恢复默认时调用）。</summary>
         private static void ApplyBinding(Binding b)
         {
-            // 盲扫描兜底解析出的动作不可信：宁可不生效，也不能改写菜单导航等其它动作的按键
-            if (b.ActionId < 0 || !b.ResolvedByName) return;
+            if (b.ActionId < 0) return;
             Rewired.Player player = GetRewiredPlayer(b.PlayerIndex);
             if (player != null) ApplyBinding(b, player);
         }
