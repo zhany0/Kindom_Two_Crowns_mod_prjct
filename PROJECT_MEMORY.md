@@ -128,6 +128,9 @@
     ②`player.mover._moveSpeed` 落在 [4,5.8) 时抬到 5.8（让当前正在跑的这一段立刻生效）。
     关闭开关时按记录把 `runSpeed` 还原、并把精确等于 5.8 的 `_moveSpeed` 退回原值，无需重启游戏。
     只用 [4,5.8) 区间，行走速度（远低于 4）与冲刺/特殊加速（高于 5.8）都不动。如需核对实际速度，临时用 `Player.currentSpeed` 观察，用完删除。
+11. **摇铃立即上船必须延后一帧**（`EmbarkeeInstantBoardPatch`）：不能在 `Embarkee.SetEmbarkableTarget` 的 Postfix 里直接 `Embark()`。
+    读档/回岛时 `Boat.ApplyData` / `LoadLegacyEmbarkees` 的恢复顺序是 `StopInert → SetEmbarkableTarget → 游戏自己 Embark()`，Postfix 抢先调用会让同一单位 `Embark` 两次；`Embark()` 先置 `IsEmbarked=true` 再申请座位，重复调用会重复占座，下船时同一单位被处理两次，导致整船 4 弓箭手 + 3 工人卡在码头原地动画，只有重开游戏才恢复。
+    正确做法：Postfix 只把单位加入 `FeatureBehaviour._pendingInstantBoards`，Update 下一帧检查 `!IsEmbarked` 且目标仍是船后才 `Embark()`；加载期间（`IsOverlayVisible()==false`）直接清空队列。
 
 ## 5. 未知字段/方法怎么查（逆向工具链）
 

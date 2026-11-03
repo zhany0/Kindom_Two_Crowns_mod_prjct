@@ -68,6 +68,10 @@ namespace BetterKingdom
         // 其余顺延到后续帧，避免多个全场景扫描/遍历叠在同一帧形成帧尖峰
         private static int _heavySlotFrame = -1;
 
+        // 摇铃立即上船的待处理队列：延后一帧再 Embark，避开读档恢复乘客时游戏自身紧接着的 Embark。
+        // 同一单位连续两次 Embark 会各占一个座位（第二次占座不释放），下船时重复处理导致整船人卡死。
+        internal static readonly List<Embarkee> _pendingInstantBoards = new List<Embarkee>();
+
         /// <summary>
         /// 申请本帧唯一的重型刷新槽位。返回 false 表示本帧已有其它重型任务在执行，
         /// 调用方不要重置自己的计时器，顺延到下一帧即可（各任务周期远大于一帧，不会饿死）。
@@ -94,7 +98,13 @@ namespace BetterKingdom
 
         private void Update()
         {
-            if (!IsOverlayVisible()) return;
+            if (!IsOverlayVisible())
+            {
+                // 读档/加载期间游戏会自己完成 Embark，本帧入队的请求已无意义，直接丢弃
+                _pendingInstantBoards.Clear();
+                return;
+            }
+            ProcessPendingInstantBoards();
             _isMenuOpen = IsMenuOpen();
             SyncWallQueueSwitch();
 
@@ -141,6 +151,34 @@ namespace BetterKingdom
         }
 
         /// <summary>
+        /// 处理“摇铃立即上船”的待登船单位：延后一帧，让读档恢复乘客时游戏自身的 Embark 先执行。
+        /// 若单位已被游戏登船、目标已失效或已不是船，就跳过，避免重复 Embark 造成重复占座。
+        /// </summary>
+        private static void ProcessPendingInstantBoards()
+        {
+            if (_pendingInstantBoards.Count == 0) return;
+            if (!ModWindowBehaviour.BellInstantBoard)
+            {
+                _pendingInstantBoards.Clear();
+                return;
+            }
+            for (int i = _pendingInstantBoards.Count - 1; i >= 0; i--)
+            {
+                Embarkee embarkee = _pendingInstantBoards[i];
+                _pendingInstantBoards.RemoveAt(i);
+                if (embarkee == null) continue;
+                try
+                {
+                    if (embarkee.IsEmbarked) continue;
+                    Embarkable target = embarkee.EmbarkableTarget;
+                    if (target == null || target._owner == null || target._owner.TryCast<Boat>() == null) continue;
+                    embarkee.Embark();
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
         /// 检测换岛（Kingdom 实例变化）：旧岛的墙体缓存、已取消工作全部作废，
         /// 避免拿旧岛数据判断新岛。
         /// </summary>
@@ -153,6 +191,7 @@ namespace BetterKingdom
                 _cachedKingdomId = kid;
                 _wallBounds.Clear();
                 _suspendedJobs.Clear();
+                _pendingInstantBoards.Clear();
                 float now = Time.unscaledTime;
                 _nextHeavyWork = now + 0.7f;     // 换岛后错峰，避免与其它重型任务同帧执行
             }
@@ -1308,9 +1347,12 @@ namespace BetterKingdom
 
     /// <summary>
     /// 摇铃后 NPC 立即上船：游戏给单位指派上船目标（SetEmbarkableTarget）是摇铃召唤的唯一途径，
-    /// 此处若目标是船且单位为工人/弓箭手/骑士（摇铃只召唤这三类），直接 Embark 传送登船，省去跑动。
-    /// 玩家无这三类组件，天然不受影响；随从弓箭手由骑士上船时指派，同样被本补丁传送；
-    /// 读档恢复乘船单位时也走同一指派路径，重复 Embark 无副作用。开关关闭时补丁直接放行。
+    /// 此处若目标是船且单位为工人/弓箭手/骑士（摇铃只召唤这三类），把单位加入待登船队列，
+    /// 由本组件的 Update 在下一帧执行 Embark，省去跑动。
+    /// 玩家无这三类组件，天然不受影响；随从弓箭手由骑士上船时指派，同样被本补丁传送。
+    /// 不能在这里直接 Embark：读档恢复乘客时游戏紧跟着自己也会调用 Embark，重复调用会重复占座，
+    /// 下船时同一单位被处理两次，导致整船人卡在码头。延后一帧后若已登船就跳过。
+    /// 开关关闭时补丁直接放行。
     /// </summary>
     [HarmonyPatch(typeof(Embarkee), nameof(Embarkee.SetEmbarkableTarget))]
     public static class EmbarkeeInstantBoardPatch
@@ -1328,7 +1370,7 @@ namespace BetterKingdom
                     && __instance.GetComponent<Archer>() == null
                     && __instance.GetComponent<Knight>() == null) return;
                 if (__instance.IsEmbarked) return;
-                __instance.Embark();
+                FeatureBehaviour._pendingInstantBoards.Add(__instance);
             }
             catch { }
         }
