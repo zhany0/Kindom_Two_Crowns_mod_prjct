@@ -17,7 +17,7 @@
 | ------------------------ | ------------------------------------------------------------------------------ |
 | `Plugin.cs`              | 注册常驻组件、集中应用 Harmony 补丁、窗口输入拦截、光标补写、IMGUI 中文字体修复                                |
 | `MapOverlayBehaviour.cs` | 所有显示逻辑：地图覆盖层、标记、时间/季节推算、血条/作物条、悬停动画                                            |
-| `FeatureBehaviour.cs`    | 所有业务功能与对应补丁（钱袋/国库联动、守墙修正、摇铃上船、传送门摧毁后工人改派）                                      |
+| `FeatureBehaviour.cs`    | 所有业务功能与对应补丁（钱袋/国库联动、守墙修正、摇铃上船）                                                         |
 | `HotkeyBindings.cs`      | 快捷键解析、组合键捕获、配置读写、Rewired 运行时绑定                                                 |
 | `ModWindowBehaviour.cs`  | 设置窗口 UI 与开关状态，**不含具体业务逻辑**；开关变化后调用 `MapOverlayBehaviour.RequestHeavyRefresh()` |
 
@@ -93,10 +93,7 @@
    - `Director.CurrentSeasonDay` 返回的是 `TotalDaysInReign`，**不是**季内天数；取季内天数要用 `CurrentSeasonStartDay` 或 `GetSeasonForDay`。
    - “季节日改为早上更新”仍只在显示层做偏移：`currentTime < dayStart≈5` 时把日序号减 1，再重新取季节（保证季节名与天数一致）。
 4. **传送门**：`PayableTeleporter.linkedTo` 是普通/双向的唯一可靠判据；`World.teleporters` 才是枚举入口，不要全场景 `FindObjectsByType`。
-5. **传送门摧毁后工人改派**：每侧保留 2 名工人，其余改派洞窟侧；必须用无状态周期性检测，不能依赖摧毁事件（旧存档中传送门可能已提前摧毁）。
-   **只改派空闲工人**（`_currentWork == null && _queuedWork == null`），正在施工/推油桶（投石车装弹）的工人绝不打断；不要调用 `SetCurrentWork(null)` / `ResetWorkState(false)`（会抢走投石车操作员、反复清空工作导致工人永远走不到新一侧）。
-   补丁（`DistributeWorkers` / `Portal.SetDestroyed` Postfix）只置标志，下一帧 `Update` 再执行改派，避免在游戏分配工人的调用栈内重入。
-6. **守墙排队机制**：`Kingdom.DistributeFreeArchers` 按顺序给同侧守墙弓箭手分配递增的 `Archer._guardDepth`（排队序号）；
+5. **守墙排队机制**：`Kingdom.DistributeFreeArchers` 按顺序给同侧守墙弓箭手分配递增的 `Archer._guardDepth`（排队序号）；
    `Archer.GetWallTargetPos` 站位 = 墙位 ∓（最小间距 `_minDistanceFromWall`1.75 + 深度×`_unitSpacingAtWall`0.11 + `_guardRandomOffset`0.25），
    `Side.Left=-1 / Side.Right=1`（正负号即方向）。深度越大离墙越远，超出 `shootRange`（默认 6.5）后无法攻击墙外怪物。
    功能开关“禁用排队机制”的做法：周期性把已分配守墙侧（`_guardSide` 为 ±1）弓箭手的 `_guardDepth` 归零，统一站到墙后最近射程内；
@@ -104,7 +101,7 @@
    骑士是另一套机制：`Kingdom.RankKnights` 给同侧骑士依次写 `Knight.rank = 1..N`，`Knight.GetTargetPos` 站位 = 墙位 ∓ `rank`×`_distanceFromWall`（rank 从 1 起算，无单独最小间距），同一开关下把 `rank > 1` 的骑士归 1；骑士跟随士兵随骑士整体前移，无需单独处理。
    `Knight.ShouldGoToWall` 会比较当前位置与 `GetTargetPos()`，因此写回 `rank` 后骑士会自行重新走位，无需调用 `RankKnights()`。
    `Pikeman` 有独立的三格墙位（`Pikeman.Assign(Wall, readiness)`，站位含 `3-readiness`），不是长队；`Berserker` 只有固定 `distanceFromWall`，无排队序号。
-7. **工人墙外避险**：不区分昼夜，某侧存在"进攻状态"怪物且工人自身位置在该侧安全距离之外时，工人跑回城墙驻守，直到该侧进攻怪物数量为 0。
+6. **工人墙外避险**：不区分昼夜，某侧存在"进攻状态"怪物且工人自身位置在该侧安全距离之外时，工人跑回城墙驻守，直到该侧进攻怪物数量为 0。
    进攻判据：`!Enemy.IsDespawning && !Enemy.shouldRetreat && !damageable.isDead && gameObject.activeSelf && Enemy.loot == null`（`loot` 非空＝已拖着金币/战利品撤回传送门）；`Enemy` 无侧别字段，用 x 与 `kingdom.castle` 的 x 比较分侧，检测结果缓存 0.2s（`RefreshSideAssault`）。
    安全距离：墙内始终安全；墙外要求距该侧城墙外沿 ≤ `SafeDistance`（20）；该侧还没有城墙时从主城（`kingdom.castle`）位置起算（`TryGetOuterWallX` 里已处理）。
    实现只用 `Worker.ShouldShelter` 的 Postfix 强制返回真：原生实现首行是 `if (kingdom.isSafe) return false`，白天会被游戏的安全态按掉，所以才需要补丁。判据 `ShouldFleeToWall` 只看工人自身位置。
@@ -116,31 +113,21 @@
    光还回记录还不够：游戏原生只在 `Director.IsDaytime` 时由 `Worker+<Behaviour>d__111::MoveNext` 调 `Kingdom.ReassignWork`（IL 356-371：`Kingdom.WorkAvailable() && Director.get_IsDaytime()`），**夜间根本不分配新工作**。所以在 `RefreshSideAssault` 里检测 `_attackOnLeft/_attackOnRight` 由真变假的那一帧，主动调用一次 `kingdom.ReassignWork()`，让夜间怪物被清掉后工人立即出门；`Kingdom.ReassignWork` 本身不检查昼夜，`Worker.ResetWorkState` 夜间也会调用。
    判据：`IsAssaultingEnemy` = `!IsDespawning && !shouldRetreat && !damageable.isDead && gameObject.activeSelf && loot == null`；`loot` 非空＝已拖着金币/战利品回传送门，不算进攻怪物（否则逃跑的怪会让工人一直不敢出门）。
    该补丁不碰 `isSafe` 与 `Director` 时钟，避免复发“复仇血月结束后时间卡死”的问题（该问题根因是白天提前 `BecomeSafe` 跳过了原生收尾分支）。
-8. **钱袋与国库共通**：真实国库账本是 `Banker._stashedCoins`（存档走 `BankerData.stashedCoins`）；
+7. **钱袋与国库共通**：真实国库账本是 `Banker._stashedCoins`（存档走 `BankerData.stashedCoins`）；
    `Castle._currentCoinCount` 只是城堡金币堆的显示镜像（`SendStashCount`/`RecvStashCount` RPC 同步，`Castle.stash` + `stashHeight` 按数量画高度），**不参与存档**。
    因此国库未解锁（场景里没有 `Banker`）时整个联动必须关闭，否则溢出金币写进显示字段会丢失、取款还会凭空造币。判定入口：`_cachedBanker == null` 直接 return。
-9. **付费攻门小队优先级**：入口是 `PayableBorder.Pay()`（玩家付费后由 `Payable.PerformPay()` 虚调用），原版在 `Kingdom.Knights` 哈希集上遍历，只按 `Knight.numArchers` 取最大，人数相同则"后遍历者"胜出（顺序随机），不看 `_wasPromoted`。
+8. **付费攻门小队优先级**：入口是 `PayableBorder.Pay()`（玩家付费后由 `Payable.PerformPay()` 虚调用），原版在 `Kingdom.Knights` 哈希集上遍历，只按 `Knight.numArchers` 取最大，人数相同则"后遍历者"胜出（顺序随机），不看 `_wasPromoted`。
    模组做法：`PayableBorder.Pay` Prefix 里按 `CanCharge()` + `|kx-border.x| <= knightRange` 筛出候选，排序键为 人数 > `_wasPromoted` > 距离更近，记下实例 ID；同期间 `Knight.CanCharge` Postfix 只放行该 ID，使原版循环必然选中它；Postfix 清理上下文。计算候选时用 `_chargePicking` 标志绕过 `CanCharge` 自身过滤，避免递归。
    小队人数 = `Knight._archers` 的 `Count`（`numArchers`），上限 `_maxArchers`（prefab 值 4）；`_numAdditionalChargeFollowers` 是冲锋时招募狂战士的参数，不是人数依据。
-10. **弓箭手打猎依赖 `_guardSide` 为 ±1**：`Side` 只有 `Left=-1 / Right=1`，0 是"尚未分配"的非法值。
-    `Archer.Behaviour` 的 Hunt 子句（协程 state 40）目标 X = `Kingdom.GetBorderSide(_guardSide) + Random.Range(borderHuntRange.min,max) * _guardSide`，
-    `Sided<T>` 对非 Left 一律返回 right，所以 `side=0` 时目标恰好等于**右侧边界（城墙）**坐标；`ShouldHunt()` 不校验 guardSide，弓箭手会在墙边原地等待，白天也不出去打猎。
-    非法侧值来源：换岛时随船（`OnDisembarkComplete → ConvertToHunter` 不清侧值）或从岛屿存档恢复的"未分配"弓箭手。
-    自愈路径只有 `Kingdom.CheckBecomeSafe()` → `DistributeFreeArchers()`（清晨安全转换时按 `Archer.isAvailable` 重新分配侧与深度），
-    但读档后王国若 `isSafe` 已为真，该路径会被直接跳过，非法侧值可长期保留。模组兜底：`FeatureBehaviour.FixInvalidGuardSides` 周期性给非法侧的空闲猎手按坐标相对露营火堆补合法侧、深度归 0。
-11. **回岛后滞留人员（弓箭手/工人）卡死无行为**：离开岛时没带走、留在岛上的人员，回岛（场景重新启用）时其 `OnEnable` 可能早于王国初始化完成。
-    `Worker.OnEnable` IL 64-72 / `Archer.OnEnable` IL 98-107 都是“取 `Managers.kingdom`，为空就直接 return”，
-    于是方法尾部真正干事的 `Kingdom.AddWorker`/`AddArcher` 与 `behaviour.In(...)`（重启 IHaglet 状态机）全部被跳过：
-    这些人既不在 `kingdom.Workers`/`kingdom.Archers` 里（永远拿不到工作），状态机也没启动 → 原地不动。
-12. **周期刷新不能同帧叠加**：`FeatureBehaviour` 与 `MapOverlayBehaviour` 的各周期任务（进攻检测、缓存、墙体修正、传送门工人、洞窟/油桶/农田全场景扫描、中/重刷新）
+9. **周期刷新不能同帧叠加**：`FeatureBehaviour` 与 `MapOverlayBehaviour` 的各周期任务（进攻检测、缓存、墙体修正、洞窟/油桶/农田全场景扫描、中/重刷新）
     共用同一个“本帧唯一重型槽位” `FeatureBehaviour.TryReserveHeavySlot()`（按 `Time.frameCount` 记账）：抢不到槽位的任务**不重置计时器**，顺延到后续帧。
     各任务周期（0.2s~10s）都远大于一帧，因此不会饿死；安全检测放在 Update 最前，优先拿槽位。
-    `Awake` 里按不同相位初始化计时器（0/0.1/0.3/0.5/0.6/0.7/1.4s），避免首帧全部到期后连续多帧排队。每帧仍照常执行的任务只有 `UpdatePurseTreasuryLink`、`SyncWallQueueSwitch`、`EnsureTimeNotStuck`（都很轻且需要帧级/秒级精度）。
-13. **玩家最高移速 6.3（功能设置页开关「玩家移动速度提升」）**：原版奔跑约 4.29（实测 4.28~4.30 浮动）。开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（4Hz）里执行：
-    ①`player.steed.runSpeed` 不足 `PlayerRunSpeedCap`(6.3) 时写 6.3，并用 `_boostedSteeds` 记录每个坐骑改动前的原值（同一坐骑只记一次）；
-    ②`player.mover._moveSpeed` 落在 [4,6.3) 时抬到 6.3（让当前正在跑的这一段立刻生效）。
-    关闭开关时按记录把 `runSpeed` 还原、并把精确等于 6.3 的 `_moveSpeed` 退回原值，无需重启游戏。
-    只用 [4,6.3) 区间，行走速度（远低于 4）与冲刺/特殊加速（高于 6.3）都不动。如需核对实际速度，临时用 `Player.currentSpeed` 观察，用完删除。
+    `Awake` 里按不同相位初始化计时器（0/0.1/0.5/0.6/0.7s），避免首帧全部到期后连续多帧排队。每帧仍照常执行的任务只有 `UpdatePurseTreasuryLink`、`SyncWallQueueSwitch`、`EnsureTimeNotStuck`（都很轻且需要帧级/秒级精度）。
+10. **玩家最高移速 5.8（功能设置页开关「玩家移动速度提升」）**：原版奔跑约 4.29（实测 4.28~4.30 浮动）。开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（4Hz）里执行：
+    ①`player.steed.runSpeed` 不足 `PlayerRunSpeedCap`(5.8) 时写 5.8，并用 `_boostedSteeds` 记录每个坐骑改动前的原值（同一坐骑只记一次）；
+    ②`player.mover._moveSpeed` 落在 [4,5.8) 时抬到 5.8（让当前正在跑的这一段立刻生效）。
+    关闭开关时按记录把 `runSpeed` 还原、并把精确等于 5.8 的 `_moveSpeed` 退回原值，无需重启游戏。
+    只用 [4,5.8) 区间，行走速度（远低于 4）与冲刺/特殊加速（高于 5.8）都不动。如需核对实际速度，临时用 `Player.currentSpeed` 观察，用完删除。
 
 ## 5. 未知字段/方法怎么查（逆向工具链）
 

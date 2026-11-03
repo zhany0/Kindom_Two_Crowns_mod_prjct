@@ -7,7 +7,7 @@ using UnityEngine;
 namespace BetterKingdom
 {
     /// <summary>
-    /// 功能实现：钱袋/国库联动、墙体内部守墙修正、摇铃立即上船、传送门摧毁后的工人分配。
+    /// 功能实现：钱袋/国库联动、墙体内部守墙修正、摇铃立即上船。
     /// 设置窗口只负责开关状态，本文件负责这些功能的运行时逻辑与 Harmony 补丁。
     /// </summary>
     public class FeatureBehaviour : MonoBehaviour
@@ -16,15 +16,14 @@ namespace BetterKingdom
         public FeatureBehaviour(IntPtr ptr) : base(ptr) { }
 
         private const float CacheInterval = 0.25f;   // 玩家/城堡/国库缓存刷新间隔
-        private const float HeavyInterval = 2f;      // 墙体修正与传送门工人检查间隔
+        private const float HeavyInterval = 2f;      // 墙体修正间隔
         private const float WallQueueClampInterval = 0.25f;  // 禁用排队时复钳间隔（游戏可能在分配补丁之外重写排队值）
         private const float AssaultCheckInterval = 0.2f;    // 墙外进攻怪物检测间隔
         private const int PurseMaxCoins = 38;        // 钱袋容量上限（钻石占 3 金币位，有效金币上限 = 38 - 3×钻石数）
         private const float PayHoldThreshold = 0.4f; // 长按判定阈值（秒），短点击不触发取款
-        private const int PortalSideWorkerLimit = 2; // 传送门被摧毁后该侧保留的工人数
         private const float SafeDistance = 20f;         // 避险安全距离：工人位置距该侧城墙外沿（无墙时距主城）超过此值且该侧有怪物出击，就跑回城墙
         private const float PlayerRunSpeedCap = 5.8f;   // 玩家奔跑最高速度：原版约 4.29，这里提升到 5.8
-        private const float PlayerRunSpeedGuard = 4f;   // 判定“正在奔跑”的下限（行走速度远低于此，不会误伤）
+        private const float PlayerRunSpeedGuard = 4f;   // 判定“正在奔跑”的下限
 
         private Player _cachedPlayer;
         private Player _cachedPlayer2;
@@ -32,8 +31,7 @@ namespace BetterKingdom
         private Banker _cachedBanker;
         private bool _isMenuOpen;
         private float _payHoldStartP1 = -1f, _payHoldStartP2 = -1f;
-        private float _nextCacheRefresh, _nextHeavyWork, _nextPortalCheck, _nextWallQueueClamp;
-        private static float _nextCaveScan;  // 兜底场景搜索洞窟的节流时间
+        private float _nextCacheRefresh, _nextHeavyWork, _nextWallQueueClamp;
         private static int _cachedKingdomId = -1;             // 用于检测换岛（Kingdom 实例变化）
         private static float _nextTimePauseCheck;             // 时间停滞检测节流时间
         private static float _lastDirectorTime = -1f;         // 上次采样到的游戏时刻（判断时钟是否真的不走）
@@ -48,7 +46,6 @@ namespace BetterKingdom
         private static readonly Dictionary<int, int> _savedGuardDepth = new();
         private static readonly Dictionary<int, int> _savedKnightRank = new();
         private bool _lastDisableWallQueue;
-        private static bool _portalCheckRequested;   // 下一帧执行一次传送门工人检查
         private static float _nextAssaultCheck;       // 下一次夜间进攻怪物检测时刻
         private static bool _attackOnLeft, _attackOnRight;   // 夜晚该侧城墙外是否有进攻中的怪物
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _assaultEnemyBuffer;
@@ -62,7 +59,6 @@ namespace BetterKingdom
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall> _wallBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<GuardSlot> _guardSlotBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight> _knightBuffer;
-        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _workerBuffer;
         // 攻门（付费冲锋）小队优先级：PayableBorder.Pay 遍历骑士时只放行选中的那支小队
         private static int _chargeBestId = -1;          // 选中小队的实例 ID
         private static bool _chargePickActive;          // 处于 PayableBorder.Pay 执行期间
@@ -94,7 +90,6 @@ namespace BetterKingdom
             _nextTimePauseCheck = now + 0.5f;
             _nextWallQueueClamp = now + 0.6f;
             _nextHeavyWork = now + 0.7f;
-            _nextPortalCheck = now + 1.4f;
         }
 
         private void Update()
@@ -143,29 +138,11 @@ namespace BetterKingdom
                 _nextHeavyWork = now + HeavyInterval;
                 FixWallDefensePositions();
             }
-
-            // 被请求时保留标志，等拿到槽位再执行，避免请求与其它重型任务同帧叠加
-            if ((_portalCheckRequested || now >= _nextPortalCheck) && TryReserveHeavySlot())
-            {
-                _portalCheckRequested = false;
-                _nextPortalCheck = now + HeavyInterval;
-                EnforcePortalWorkerLimit();
-            }
         }
 
         /// <summary>
-        /// 请求执行一次传送门工人检查（传送门摧毁或游戏重新分配工人时调用）。
-        /// 只置标志、下一帧 Update 里执行：若在 DistributeWorkers 的 Postfix 里直接改派，
-        /// 会打断游戏正在进行的工人分配，影响投石车等岗位的人手。
-        /// </summary>
-        public static void RequestPortalWorkerCheck()
-        {
-            _portalCheckRequested = true;
-        }
-
-        /// <summary>
-        /// 检测换岛（Kingdom 实例变化）：旧岛的墙体缓存、已取消工作、安全态节流全部作废，
-        /// 立即重建墙体边界并重新评估安全态，避免拿旧岛数据判断新岛。
+        /// 检测换岛（Kingdom 实例变化）：旧岛的墙体缓存、已取消工作全部作废，
+        /// 避免拿旧岛数据判断新岛。
         /// </summary>
         private void TrackKingdomChange(Kingdom kingdom)
         {
@@ -177,8 +154,7 @@ namespace BetterKingdom
                 _wallBounds.Clear();
                 _suspendedJobs.Clear();
                 float now = Time.unscaledTime;
-                _nextHeavyWork = now + 0.7f;     // 换岛后同样错峰，避免两个重型任务同帧执行
-                _nextPortalCheck = now + 1.4f;
+                _nextHeavyWork = now + 0.7f;     // 换岛后错峰，避免与其它重型任务同帧执行
             }
             catch { }
         }
@@ -439,9 +415,6 @@ namespace BetterKingdom
 
                 // 禁用守墙排队（不依赖墙体缓存，先执行）
                 DisableWallQueueing(kingdom);
-
-                // 修正非法守墙侧（不依赖墙体缓存，先执行）
-                FixInvalidGuardSides(kingdom);
 
                 CollectWallBounds(kingdom);
                 if (_wallBounds.Count == 0) return;
@@ -720,50 +693,6 @@ namespace BetterKingdom
             _savedKnightRank.Clear();
         }
 
-        // ==================== 非法守墙侧修正 ====================
-
-        /// <summary>
-        /// 修正非法的守墙侧：Side 只有 Left=-1 / Right=1，0 表示“尚未分配”。
-        /// 根因：换岛时随船或从该岛存档恢复的弓箭手可能保留 Side=0；
-        /// Archer.Behaviour 的打猎目标 X = Kingdom.GetBorderSide(_guardSide) + Random.Range(borderHuntRange) * _guardSide，
-        /// 而 Sided 取值对非 Left 一律返回 right，随机距离又被 0 乘掉，目标恰好落在右侧城墙位置，
-        /// 弓箭手走到墙边原地等待，白天也不出去打猎（ShouldHunt 不校验 guardSide，状态机不会自行纠正）。
-        /// 另外读档后王国若已是安全状态，Kingdom.CheckBecomeSafe 会因 isSafe 已为真而跳过 DistributeFreeArchers，
-        /// 非法侧值可能长期保留，所以这里做周期性兜底。
-        /// 只处理空闲猎手（无守墙槽/无骑士/未上船），按坐标相对露营火堆的左右侧补齐合法侧，排队深度归 0。
-        /// </summary>
-        private static void FixInvalidGuardSides(Kingdom kingdom)
-        {
-            try
-            {
-                Il2CppSystem.Collections.Generic.ICollection<Archer> archers = kingdom.Archers;
-                if (archers == null) return;
-                int count = archers.Count;
-                if (count <= 0) return;
-                if (_archerBuffer == null || _archerBuffer.Length < count)
-                    _archerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(Math.Max(count, 64));
-                var arr = _archerBuffer;
-                archers.CopyTo(arr, 0);
-                for (int i = 0; i < count; i++)
-                {
-                    Archer a = arr[i];
-                    if (a == null) continue;
-                    try
-                    {
-                        Side side = a._guardSide;
-                        if (side == Side.Left || side == Side.Right) continue;
-                        // 塔上/骑士麾下/上船中的弓箭手由各自机制管理，不改动
-                        if (!a.isAvailable) continue;
-
-                        float x = a.transform.position.x;
-                        a.SetGuardSide(SideFromX(kingdom, x), 0);
-                    }
-                    catch { }
-                }
-            }
-            catch { }
-        }
-
         /// <summary>收集真实墙体的水平边界（中心X与半宽），供弓箭手守墙bug修正使用。</summary>
         private void CollectWallBounds(Kingdom kingdom)
         {
@@ -905,119 +834,6 @@ namespace BetterKingdom
             x = 0f;
             try { if (component == null) return false; x = component.transform.position.x; return true; }
             catch { return false; }
-        }
-
-        // ==================== 传送门摧毁后的工人分配 ====================
-
-        /// <summary>
-        /// 传送门（非洞窟）被摧毁后，该侧工人只保留 2 名，其余全部改派到洞窟一侧。
-        /// 游戏原生 DistributeWorkers 会在两侧各保留 4 名工人，这里在其执行之后再做一次上限收敛。
-        /// </summary>
-        private void EnforcePortalWorkerLimit()
-        {
-            try
-            {
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Kingdom kingdom = managers != null ? managers.kingdom : null;
-                if (kingdom != null) EnforcePortalWorkerLimit(kingdom);
-            }
-            catch { }
-        }
-
-        private static void EnforcePortalWorkerLimit(Kingdom kingdom)
-        {
-            try
-            {
-                // 传送门集合为空通常意味着读档早期尚未注册，此时两侧都没有传送门，
-                // 若直接判断会把正常一侧误判为"传送门已摧毁"
-                int portalCount = 0;
-                try { Il2CppSystem.Collections.Generic.HashSet<Portal> all = kingdom.AllPortals; if (all != null) portalCount = all.Count; } catch { }
-                if (portalCount == 0) return;
-
-                Side caveSide;
-                if (!TryGetCaveSide(kingdom, out caveSide)) return;   // 没有洞窟时不做调整
-
-                // 两侧分别检查：只处理没有可用传送门的一侧，且该侧不是洞窟一侧
-                CheckPortalSide(kingdom, Side.Left, caveSide);
-                CheckPortalSide(kingdom, Side.Right, caveSide);
-            }
-            catch { }
-        }
-
-        /// <summary>指定一侧如果已经没有可用传送门，则把该侧工人收敛到 2 名，多余者改派洞窟一侧。</summary>
-        private static void CheckPortalSide(Kingdom kingdom, Side portalSide, Side caveSide)
-        {
-            if (portalSide == caveSide) return;
-            if (HasUsablePortalOn(kingdom, portalSide)) return;
-            CapWorkersOnSide(kingdom, portalSide, caveSide);
-        }
-
-        /// <summary>判断该侧是否存在仍可用（非摧毁状态）的普通或码头传送门。</summary>
-        private static bool HasUsablePortalOn(Kingdom kingdom, Side side)
-        {
-            try
-            {
-                foreach (Portal portal in kingdom.AllPortals)
-                {
-                    if (portal == null) continue;
-                    try
-                    {
-                        if (portal.type == Portal.Type.Cliff) continue;   // 洞窟不是传送门
-                    }
-                    catch { continue; }
-
-                    if (!TryGetX(portal, out float x)) continue;
-                    if (SideFromX(kingdom, x) != side) continue;
-
-                    Portal.State state;
-                    try { state = portal.state; } catch { continue; }
-                    if (state != Portal.State.Crumbled && state != Portal.State.Rebuilding
-                        && state != Portal.State.Destroyed && state != Portal.State.Passable)
-                        return true;
-                }
-            }
-            catch { }
-            return false;
-        }
-
-        /// <summary>把该侧工人保留 2 名，其余空闲者改派洞窟一侧（有工作的工人不动，下一轮空闲时再改派）。</summary>
-        private static void CapWorkersOnSide(Kingdom kingdom, Side portalSide, Side caveSide)
-        {
-            try
-            {
-                Il2CppSystem.Collections.Generic.ICollection<Worker> workers = kingdom.Workers;
-                if (workers == null) return;
-                int count = workers.Count;
-                if (count <= 0) return;
-
-                if (_workerBuffer == null || _workerBuffer.Length < count)
-                    _workerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(count, 32));
-                var arr = _workerBuffer;
-                workers.CopyTo(arr, 0);
-
-                int kept = 0;
-                for (int i = 0; i < count; i++)
-                {
-                    Worker worker = arr[i];
-                    if (worker == null) continue;
-
-                    Side targetSide;
-                    try { targetSide = worker._targetSide; } catch { continue; }
-                    if (targetSide != portalSide) continue;
-
-                    if (kept < PortalSideWorkerLimit) { kept++; continue; }
-
-                    // 只改派空闲工人：正在施工、推油桶（投石车装弹）等有工作的工人绝不打断，
-                    // 否则会抢走投石车操作员，或因反复清空工作让工人永远走不到新一侧
-                    bool busy;
-                    try { busy = worker._currentWork != null || worker._queuedWork != null; } catch { busy = true; }
-                    if (busy) continue;
-
-                    try { worker.SetWorkerSide(caveSide); } catch { }
-                    try { worker._targetSide = caveSide; } catch { }
-                }
-            }
-            catch { }
         }
 
         // ==================== 工人避险（墙外有进攻怪物时撤回，不区分昼夜） ====================
@@ -1454,54 +1270,6 @@ namespace BetterKingdom
             return false;
         }
 
-        /// <summary>
-        /// 取洞窟所在侧：洞窟本身是 Cliff 类型的 Portal，优先遍历 AllPortals 取坐标；
-        /// 找不到时再低频兜底搜索场景中的 BombablePortal（洞窟入口组件）。
-        /// </summary>
-        private static bool TryGetCaveSide(Kingdom kingdom, out Side side)
-        {
-            side = Side.Left;
-            try
-            {
-                foreach (Portal portal in kingdom.AllPortals)
-                {
-                    if (portal == null) continue;
-                    Portal.Type type;
-                    try { type = portal.type; } catch { continue; }
-                    if (type != Portal.Type.Cliff) continue;
-                    if (TryGetX(portal, out float x))
-                    {
-                        side = SideFromX(kingdom, x);
-                        return true;
-                    }
-                }
-            }
-            catch { }
-
-            // 兜底：全场景搜索开销大，最多每 10 秒执行一次
-            float now = Time.unscaledTime;
-            if (now < _nextCaveScan) return false;
-            _nextCaveScan = now + 10f;
-            try
-            {
-                var caves = UnityEngine.Object.FindObjectsByType<BombablePortal>(FindObjectsInactive.Include, FindObjectsSortMode.None);
-                if (caves == null || caves.Length == 0) return false;
-                for (int i = 0; i < caves.Length; i++)
-                {
-                    BombablePortal cave = caves[i];
-                    if (cave == null) continue;
-                    if (TryGetX(cave, out float x))
-                    {
-                        side = SideFromX(kingdom, x);
-                        return true;
-                    }
-                    try { side = cave.side; return true; } catch { }
-                }
-            }
-            catch { }
-            return false;
-        }
-
         /// <summary>按露营火堆位置判断世界坐标位于地图哪一侧。</summary>
         internal static Side SideFromX(Kingdom kingdom, float x)
         {
@@ -1563,32 +1331,6 @@ namespace BetterKingdom
                 __instance.Embark();
             }
             catch { }
-        }
-    }
-
-    /// <summary>游戏重新分配工人后立即检查一次，保证传送门一侧的工人上限及时生效。</summary>
-    [HarmonyPatch(typeof(Kingdom), nameof(Kingdom.DistributeWorkers))]
-    public static class PortalWorkerDistributionPatch
-    {
-        public static void Postfix()
-        {
-            FeatureBehaviour.RequestPortalWorkerCheck();
-        }
-    }
-
-    /// <summary>传送门被摧毁时立即标记检查：只响应非洞窟的传送门。</summary>
-    [HarmonyPatch(typeof(Portal), nameof(Portal.SetDestroyed))]
-    public static class PortalDestroyedPatch
-    {
-        public static void Postfix(Portal __instance)
-        {
-            if (__instance == null) return;
-            try
-            {
-                if (__instance.type == Portal.Type.Cliff) return;   // 洞窟不参与该规则
-            }
-            catch { return; }
-            FeatureBehaviour.RequestPortalWorkerCheck();
         }
     }
 
