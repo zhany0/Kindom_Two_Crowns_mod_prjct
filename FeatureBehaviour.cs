@@ -32,7 +32,7 @@ namespace BetterKingdom
         private const float StationSideCheckInterval = 2f;  // 传送门被毁后的驻守侧改派检测间隔（只在单侧无门时才有写操作）
         private const int HeavySlotGapFrames = 1;           // 两个重型任务之间至少空出的帧数
         private const float SafeDistance = 20f;         // 避险安全距离：工人位置距该侧城墙外沿（无墙时距主城）超过此值且该侧有怪物出击，就跑回城墙
-        private const float PlayerRunSpeedCap = 5.8f;   // 玩家奔跑最高速度：原版约 4.29，这里提升到 5.8
+        private const float PlayerRunSpeedCap = 6.3f;   // 玩家奔跑最高速度：原版约 4.29，这里提升到 6.3
         private const float PlayerRunSpeedGuard = 4f;   // 判定“正在奔跑”的下限
 
         private Player _cachedPlayer;
@@ -83,7 +83,8 @@ namespace BetterKingdom
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<GuardSlot> _guardSlotBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight> _knightBuffer;
         // 攻门（付费冲锋）小队优先级：PayableBorder.Pay 遍历骑士时只放行选中的那支小队
-        private static int _chargeBestId = -1;          // 选中小队的实例 ID
+        private static int _chargeBestId = -1;          // 选中小队的实例 ID（IL2CPP 实例 ID 常为负数）
+        private static bool _chargeHasPick;             // 是否已选中可用小队（不能用 ID 正负判断）
         private static bool _chargePickActive;          // 处于 PayableBorder.Pay 执行期间
         private static bool _chargePicking;             // 正在计算最佳小队（绕过 CanCharge 过滤）
 
@@ -1666,19 +1667,26 @@ namespace BetterKingdom
         // ==================== 攻门（付费冲锋）小队优先级 ====================
 
         /// <summary>
-        /// 是否为“高级骑士”（用铁剑晋升的骑士）。
-        /// 不能用 _wasPromoted 判断：该字段只在 Knight.OnKnightPromote 里把“被替换下场的旧侍从”置为 true，
-        /// 旧对象随后就被 Character.Promote 回收；而 Knight.OnEnable 又会把该字段清零，
-        /// 因此活着的晋升骑士此字段恒为 false（此前“满员时仍不优先高级骑士”就是这个原因）。
-        /// 游戏用 GameObject tag 区分：侍从为 "Squire"、晋升骑士为 "Knight"（Character.Promote/Demote 可证），
-        /// 这里以 tag 为准，_wasPromoted 仅作兜底。
+        /// 骑士“高级程度”评分：先看 GameObject tag（侍从 "Squire" / 晋升骑士 "Knight"），
+        /// 同级再看是否已拿到铁甲（NeedsArmor 为 false 表示已穿甲，含铁剑）。
+        /// tag 权重 2 略高：游戏正是用 tag 区分侍从与骑士；
+        /// 铁甲权重 1 作同级细分——两者都相同时才退回按距离比较。
+        /// 不能用 _wasPromoted 判断：该字段只在 Knight.OnKnightPromote 里给“被替换下场的旧侍从”置位，
+        /// 而 Knight.OnEnable 又会把它清零，活着的骑士此字段恒为 false。
         /// </summary>
+        internal static int KnightAdvancedScore(Knight k)
+        {
+            if (k == null) return 0;
+            int score = 0;
+            try { if (k.CompareTag("Knight")) score += 2; } catch { }
+            try { if (!k.NeedsArmor) score += 1; } catch { }
+            return score;
+        }
+
+        /// <summary>是否为“高级骑士”（用铁剑晋升的骑士）：tag 为 Knight 或已穿铁甲。</summary>
         internal static bool IsAdvancedKnight(Knight k)
         {
-            if (k == null) return false;
-            try { if (k.CompareTag("Knight")) return true; } catch { }
-            try { return k._wasPromoted; } catch { }
-            return false;
+            return KnightAdvancedScore(k) > 0;
         }
 
         /// <summary>
@@ -1689,6 +1697,7 @@ namespace BetterKingdom
         public static void PrepareChargePick(PayableBorder border)
         {
             _chargeBestId = -1;
+            _chargeHasPick = false;
             _chargePickActive = true;
             _chargePicking = true;
             try
@@ -1708,7 +1717,7 @@ namespace BetterKingdom
                 knights.CopyTo(arr, 0);
 
                 int bestCount = -1;
-                bool bestPromoted = false;
+                int bestScore = -1;
                 float bestDist = float.MaxValue;
 
                 for (int i = 0; i < arr.Length; i++)
@@ -1723,38 +1732,54 @@ namespace BetterKingdom
                     int count;
                     try { count = k.numArchers; } catch { count = 0; }
                     if (count <= 0) continue;
-                    bool promoted = IsAdvancedKnight(k);
+                    int score = KnightAdvancedScore(k);
 
                     bool better;
                     if (count != bestCount) better = count > bestCount;
-                    else if (promoted != bestPromoted) better = promoted;
+                    else if (score != bestScore) better = score > bestScore;
                     else better = dist < bestDist;
                     if (!better) continue;
 
                     bestCount = count;
-                    bestPromoted = promoted;
+                    bestScore = score;
                     bestDist = dist;
                     _chargeBestId = k.GetInstanceID();
+                    _chargeHasPick = true;
                 }
             }
             catch { }
             finally { _chargePicking = false; }
         }
 
-        /// <summary>PayableBorder.Pay 结束后清除攻门选人上下文。</summary>
+        /// <summary>PayableBorder.Pay 结束：关闭过滤，后续付钱不受本次选人影响（可连续出动）。</summary>
         public static void FinishChargePick()
         {
             _chargePickActive = false;
-            _chargeBestId = -1;
         }
 
-        /// <summary>PayableBorder.Pay 遍历骑士期间，只让选中的小队通过 CanCharge。</summary>
+        /// <summary>
+        /// 过滤是否有效：仅在 PayableBorder.Pay 执行期间生效。
+        /// 不能延长到付钱之后——否则其余骑士的 CanCharge 被判 false，
+        /// 游戏会认为该侧暂无可用小队而短暂禁止继续付钱，破坏原版的连续出动节奏。
+        /// </summary>
+        private static bool ChargeFilterActive()
+        {
+            if (_chargePicking) return false;
+            if (!_chargePickActive) return false;
+            return _chargeHasPick;   // 实例 ID 可能是负数，不能用 "_chargeBestId >= 0" 判定“是否有选中”
+        }
+
+        private static int SafeId(Knight k)
+        {
+            try { return k != null ? k.GetInstanceID() : -1; } catch { }
+            return -1;
+        }
+
+        /// <summary>Pay 遍历骑士期间，只让选中的小队通过 CanCharge。</summary>
         public static bool AllowChargeCandidate(Knight k)
         {
-            if (!_chargePickActive || _chargePicking) return true;
-            if (_chargeBestId < 0) return true;   // 没有可冲锋小队时保持原版行为
-            try { return k.GetInstanceID() == _chargeBestId; } catch { }
-            return true;
+            if (!ChargeFilterActive()) return true;
+            return SafeId(k) == _chargeBestId;
         }
 
         /// <summary>怪物是否处于进攻状态：在场、存活、未决定撤退、未携带战利品离开。

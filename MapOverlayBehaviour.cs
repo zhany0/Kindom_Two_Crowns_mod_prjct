@@ -267,6 +267,10 @@ namespace BetterKingdom
             // 使同一帧内 MOD 是最后写入者，避免与游戏互相覆盖同一个状态导致光标频闪
             _wantCursor = !_isMenuOpen || ModWindowBehaviour.IsOpen;
 
+            // 玩家位置每帧刷新：小地图上的玩家点必须紧跟角色移动，10Hz 会明显看到跳动；
+            // 这里只读一次玩家引用与 transform，开销极小，其余轻刷新仍按 10Hz 跑
+            RefreshPlayerX();
+
             float now = Time.unscaledTime;
 
             // 全场景扫描彼此错峰，并与功能组件的周期任务共用同一个“本帧唯一重型槽位”：
@@ -342,7 +346,29 @@ namespace BetterKingdom
             if (Instance != null) Instance._nextHeavyRefresh = 0f;
         }
 
-        /// <summary>轻刷新（20Hz）：只更新需要实时跟随的数据——玩家位置与怪物竖线。</summary>
+        /// <summary>
+        /// 玩家世界坐标（每帧刷新）：只做关键路径的两次互操作读取，
+        /// 保证小地图玩家点平滑跟随，不受轻刷新 10Hz 的限制。
+        /// </summary>
+        private void RefreshPlayerX()
+        {
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) { _hasPlayer = false; return; }
+                Player player = kingdom.playerOne ?? kingdom.GetPlayer(0);
+                if (TryGetX(player, out float px))
+                {
+                    _playerX = px;
+                    _hasPlayer = true;
+                }
+                else _hasPlayer = false;
+            }
+            catch { _hasPlayer = false; }
+        }
+
+        /// <summary>轻刷新（10Hz）：只更新怪物竖线与怪物血条、作物进度；玩家位置已改为每帧刷新。</summary>
         private void RefreshLightData()
         {
             try
@@ -351,18 +377,6 @@ namespace BetterKingdom
                 if (managers == null) return;
                 Kingdom kingdom = managers.kingdom;
                 if (kingdom == null) return;
-
-                _hasPlayer = false;
-                try
-                {
-                    Player player = kingdom.playerOne ?? kingdom.GetPlayer(0);
-                    if (TryGetX(player, out float px))
-                    {
-                        _playerX = px;
-                        _hasPlayer = true;
-                    }
-                }
-                catch { }
 
                 // 怪物竖线与怪物血条：两个开关都关闭时完全不必遍历敌人（关闭瞬间清空一次残留）
                 if (ModWindowBehaviour.ShowMapEnemies || ModWindowBehaviour.ShowGreedHealth)
@@ -562,7 +576,7 @@ namespace BetterKingdom
             AddJobLine("弓箭手", Math.Max(0, _countArchers - _countSquadArchers));
             AddJobLine("小队弓箭手", _countSquadArchers);
             // 骑士总数中拆出用剑升级过的高级骑士，分两行显示
-            AddJobLine("骑士", Math.Max(0, _countKnights - _countKnightsAdvanced));
+            AddJobLine("普通骑士", Math.Max(0, _countKnights - _countKnightsAdvanced));
             AddJobLine("高级骑士", _countKnightsAdvanced);
             AddJobLine("长矛兵", _countPikemen);
             AddJobLine("农夫", _countFarmers);
