@@ -38,14 +38,20 @@ namespace BetterKingdom
             harmony.PatchAll(typeof(CursorSystemUpdatePatch));
             // 功能实现相关补丁：摇铃立即上船、禁用守墙排队
             harmony.PatchAll(typeof(EmbarkeeInstantBoardPatch));
+            // 摇铃选人窗口：付钱摇铃时拦截原生的召唤，先让玩家选择各职业带走人数
+            harmony.PatchAll(typeof(BoatSummoningBellPayPatch));
+            harmony.PatchAll(typeof(BoatSummonBellSelectPatch));
             harmony.PatchAll(typeof(WallQueueArcherDistributionPatch));
             harmony.PatchAll(typeof(WallQueueFreeArcherDistributionPatch));
             harmony.PatchAll(typeof(WallQueueKnightRankPatch));
+            // 骑士去拿铁剑（盔甲）途中不被“回城墙驻守”打断
+            harmony.PatchAll(typeof(KnightKeepArmorGrabPatch));
             // 工人避险相关：该侧有怪物出击时拒绝安全距离外的新工作，并让已越界的工人回城墙驻守
             harmony.PatchAll(typeof(WorkerAssignSafeJobPatch));
             harmony.PatchAll(typeof(WorkerSetCurrentWorkSafePatch));
             harmony.PatchAll(typeof(WorkerPayWorkSafePatch));
             harmony.PatchAll(typeof(WorkerRecallShelterPatch));
+            harmony.PatchAll(typeof(WorkerStationSideOnEnablePatch));
             harmony.PatchAll(typeof(ChargeSquadPriorityPayPatch));
             harmony.PatchAll(typeof(ChargeSquadPriorityCanChargePatch));
         }

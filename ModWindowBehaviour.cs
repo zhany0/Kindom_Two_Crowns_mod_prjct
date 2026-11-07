@@ -113,6 +113,42 @@ namespace BetterKingdom
         private readonly List<GameObject> _waitButtonGos = new();  // 确定/取消按钮
         private bool _waitingForKey;         // 正在等待玩家按键
 
+        // ---- 摇铃选人窗口（独立 Canvas，与设置窗口互斥） ----
+        private const int SailorCanvasSortOrder = 5100;       // 高于设置窗口，确保完整可见
+        private const float SailorPanelWidth = 760f;          // 面板宽
+        private const float SailorPanelHeight = 380f;         // 面板高（三行各占 1/3，不留深色空白）
+        private const float SailorRowHeight = SailorPanelHeight / 3f;  // 每行高：三行平分整个面板
+        private const float SailorRowGap = 0f;                // 行间距：无缝相接（取消每行底部边框）
+        private const float SailorRowsTop = 0f;               // 首行从面板顶边开始
+        private const float SailorRowMargin = 0f;             // 行距面板左右内缘（0 = 铺满面板，去掉两侧黑底与留白）
+        private const float SailorRowPadding = 24f;           // 行内文字距行边框
+        private const float SailorLabelWidth = 150f;          // 职业名占位宽
+        private const float SailorValueWidth = 70f;           // 人数数值占位宽
+        private const int SailorLabelFontSize = 26;           // 职业名/数值字号
+        private const int SailorDefaultWorkers = 3;           // 工人默认带走人数
+        private const int SailorDefaultArchers = 4;           // 弓箭手默认带走人数
+        private const int SailorDefaultKnights = 3;           // 骑士小队默认带走数量
+        private static readonly Color SailorValueColor = new(1f, 0.88f, 0.55f, 1f);  // 人数数值（暖黄，便于快速读数）
+        private const float SailorSeparatorHeight = 2f;       // 行间细线高
+        private static readonly Color SailorSeparatorColor = new(0f, 0f, 0f, 0.55f);  // 行间细线（半透明黑）
+        private const float SailorSliderHollowInset = 6f;     // 滑条内部镂空保留的边框厚（过细会显得廉价）
+        private static readonly Color SailorSliderEmptyColor = new(0.12f, 0.10f, 0.085f, 1f);  // 滑条未选中段（暗色）
+        private static Sprite _sailorRowFillSprite;           // 行背板纯色精灵（取按钮精灵内部单像素，无九宫格边框）
+
+        private static ModWindowBehaviour _instance;          // 组件单例（静态 UI 入口使用）
+        private GameObject _sailorCanvasGo;                   // 选人窗口 Canvas（懒构建后复用）
+        private bool _sailorOpen;                             // 选人窗口是否打开
+        private Slider _sailorSliderWorker, _sailorSliderArcher, _sailorSliderKnight;
+        private Text _sailorValueWorker, _sailorValueArcher, _sailorValueKnight;
+        private RectTransform _sailorHollowWorker, _sailorHollowArcher, _sailorHollowKnight;  // 滑条镂空覆盖层（左边界随滑点）
+        private float _hollowWorkerValue = -1f, _hollowArcherValue = -1f, _hollowKnightValue = -1f;  // 上次同步的滑条值（避免每帧写入触发布局重建）
+        private int _sailorMaxWorkers, _sailorMaxArchers, _sailorMaxKnights;
+
+        private void Awake()
+        {
+            _instance = this;
+        }
+
         /// <summary>地图子选项联动：地图显示关闭时全部子选项变淡且禁交互；"只显示已建造"还需父选项开启，父级取消时联动取消并持久化。</summary>
         private void UpdateMapSubRowStates()
         {
@@ -254,6 +290,13 @@ namespace BetterKingdom
         {
             // 定时重试：等 Rewired 就绪后解析游戏动作并应用已保存的改绑
             HotkeyBindings.Tick();
+
+            // 摇铃选人窗口独占输入：ESC 取消，屏蔽设置窗口的开关快捷键
+            if (_sailorOpen)
+            {
+                UpdateSailorWindow();
+                return;
+            }
 
             // 等待按键输入状态：独占键盘，捕获新快捷键，屏蔽开关窗/ESC 等一切按键逻辑
             if (_waitingForKey)
@@ -1236,6 +1279,30 @@ namespace BetterKingdom
             return _flatSlotSprite;
         }
 
+        /// <summary>
+        /// 生成行背板用的纯色精灵：从拍平精灵内部取一个像素做成 1×1 精灵，
+        /// 拉伸铺满时不带九宫格边框与渐变，颜色与“行框内颜色”完全一致（用于摇铃选人窗口的三行与滑条轨道）。
+        /// </summary>
+        private static Sprite GetRowFlatSprite(Sprite src)
+        {
+            if (_sailorRowFillSprite != null) return _sailorRowFillSprite;
+            try
+            {
+                Sprite flat = GetFlatSlotSprite(src);
+                Rect r = flat.textureRect;
+                Color c = flat.texture.GetPixel(Mathf.RoundToInt(r.center.x), Mathf.RoundToInt(r.center.y));
+                var tex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+                tex.SetPixel(0, 0, c);
+                tex.filterMode = FilterMode.Point;
+                tex.Apply();
+                tex.hideFlags = HideFlags.HideAndDontSave;
+                _sailorRowFillSprite = Sprite.Create(tex, new Rect(0f, 0f, 1f, 1f), new Vector2(0.5f, 0.5f),
+                    flat.pixelsPerUnit, 0, SpriteMeshType.FullRect);
+            }
+            catch { _sailorRowFillSprite = src; }
+            return _sailorRowFillSprite;
+        }
+
         /// <summary>切换分页：显示目标页，页签选中态通过 interactable 切换（选中页签压暗且不可再点）；滚动条随页切换显隐。</summary>
         private void ShowPage(int index)
         {
@@ -1302,6 +1369,46 @@ namespace BetterKingdom
                 catch { }
             }
             return FindFallbackFont();
+        }
+
+        /// <summary>
+        /// 取摇铃选人窗口用的字体：优先游戏原生菜单字体（与游戏按钮文字同款），
+        /// 按整串字符校验字形覆盖，缺字时依次尝试其它原生字体，全部不覆盖才回退系统字体，
+        /// 避免位图字体缺字导致文字变空白。
+        /// </summary>
+        private static Font ResolveSailorFont(string sample, Font fallbackFont)
+        {
+            try
+            {
+                Texts texts = Language.current;
+                if (texts != null)
+                {
+                    Font f = texts.menuFont != null ? texts.menuFont.font : null;
+                    if (f != null && FontCoversAllChars(f, sample)) return f;
+                    f = texts.menuSmallFont != null ? texts.menuSmallFont.font : null;
+                    if (f != null && FontCoversAllChars(f, sample)) return f;
+                    f = texts.menuAltFont != null ? texts.menuAltFont.font : null;
+                    if (f != null && FontCoversAllChars(f, sample)) return f;
+                    f = texts.regularFont != null ? texts.regularFont.font : null;
+                    if (f != null && FontCoversAllChars(f, sample)) return f;
+                    f = texts.bigTextFont != null ? texts.bigTextFont.font : null;
+                    if (f != null && FontCoversAllChars(f, sample)) return f;
+                }
+            }
+            catch { }
+            return ResolveUIFont(fallbackFont);
+        }
+
+        /// <summary>字体是否覆盖整串字符（含数字/汉字），缺任意一个字形即视为不可用。</summary>
+        private static bool FontCoversAllChars(Font font, string sample)
+        {
+            try
+            {
+                for (int i = 0; i < sample.Length; i++)
+                    if (!font.HasCharacter(sample[i])) return false;
+                return true;
+            }
+            catch { return false; }
         }
 
         // ---- 恢复默认确认弹窗 ----
@@ -1401,6 +1508,458 @@ namespace BetterKingdom
             try { return Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"); } catch { }
             try { return Resources.GetBuiltinResource<Font>("Arial.ttf"); } catch { }
             return null;
+        }
+
+        // ================= 摇铃选人窗口 =================
+
+        /// <summary>
+        /// 摇铃后弹出选人窗口：分别显示工人 / 弓箭手 / 骑士小队的实际人数上限，
+        /// 默认带走人数为 3 / 4 / 3（不足默认值则取实际人数），人数选择沿用游戏原生音量滑条样式。
+        /// 返回 false 表示窗口无法显示，调用方应放行游戏原生摇铃。
+        /// </summary>
+        public static bool ShowSailorSelect(int maxWorkers, int maxArchers, int maxKnights)
+        {
+            ModWindowBehaviour host = Instance();
+            if (host == null) return false;
+            if (host._sailorOpen || IsOpen) return false;
+            if (!host.TryBuildSailorUi()) return false;
+
+            host._sailorMaxWorkers = Mathf.Max(0, maxWorkers);
+            host._sailorMaxArchers = Mathf.Max(0, maxArchers);
+            host._sailorMaxKnights = Mathf.Max(0, maxKnights);
+            host.ApplySailorLimits();
+
+            host._sailorOpen = true;
+            IsOpen = true;
+            host._prevTimeScale = Time.timeScale;
+            Time.timeScale = 0f;
+            if (host._sailorCanvasGo != null) host._sailorCanvasGo.SetActive(true);
+            host.EnsureEventSystem();
+            AcquireCursor();
+            if (Cursor.lockState != CursorLockMode.None) Cursor.lockState = CursorLockMode.None;
+            return true;
+        }
+
+        /// <summary>获取组件实例（优先缓存，插件刚加载时兜底在场景里查找）。</summary>
+        private static ModWindowBehaviour Instance()
+        {
+            if (_instance != null) return _instance;
+            try
+            {
+                var found = UnityEngine.Object.FindObjectsByType<ModWindowBehaviour>(
+                    FindObjectsInactive.Include, FindObjectsSortMode.None);
+                if (found != null && found.Length > 0) _instance = found[0];
+            }
+            catch { }
+            return _instance;
+        }
+
+        /// <summary>按当前实际人数设置三条滑条的上限与默认值。</summary>
+        private void ApplySailorLimits()
+        {
+            ConfigureSailorSlider(_sailorSliderWorker, _sailorMaxWorkers, SailorDefaultWorkers);
+            ConfigureSailorSlider(_sailorSliderArcher, _sailorMaxArchers, SailorDefaultArchers);
+            ConfigureSailorSlider(_sailorSliderKnight, _sailorMaxKnights, SailorDefaultKnights);
+            UpdateSailorValueLabels();
+            UpdateSailorHollows();
+        }
+
+        private static void ConfigureSailorSlider(Slider slider, int max, int preferred)
+        {
+            if (slider == null) return;
+            int limit = Mathf.Max(0, max);
+            int value = Mathf.Clamp(preferred, 0, limit);
+            slider.minValue = 0f;
+            slider.maxValue = Mathf.Max(1, limit);   // 为 0 时仍取 1，避免滑条宽度计算出现除零
+            slider.wholeNumbers = true;
+            slider.interactable = limit > 0;
+            slider.value = (float)value;
+        }
+
+        /// <summary>每帧同步滑条数值文本（暂停期间 Update 仍会执行，无需额外注册回调）。</summary>
+        private void UpdateSailorWindow()
+        {
+            // 游戏离开游玩状态（读档/回主菜单/退出）时强制结束选人，避免 timeScale=0 残留导致画面冻结
+            if (!IsInGameplay())
+            {
+                AbortSailorSelect();
+                return;
+            }
+            UpdateSailorValueLabels();
+            UpdateSailorHollows();
+            if (_ownCursorForced) Cursor.visible = true;
+            if (Cursor.lockState != CursorLockMode.None) Cursor.lockState = CursorLockMode.None;
+            EventSystem cur = EventSystem.current;
+            if (cur == null || !cur.isActiveAndEnabled) EnsureEventSystem();
+        }
+
+        /// <summary>强制结束选人（不执行摇铃）：仅恢复窗口与暂停状态，本次付钱摇铃不再召唤。</summary>
+        private void AbortSailorSelect()
+        {
+            if (!_sailorOpen) return;
+            CloseSailorWindow();
+            FeatureBehaviour.AbortBellSelection();
+        }
+
+        private void UpdateSailorValueLabels()
+        {
+            if (_sailorValueWorker != null)
+                _sailorValueWorker.text = SailorSliderValue(_sailorSliderWorker, _sailorMaxWorkers).ToString();
+            if (_sailorValueArcher != null)
+                _sailorValueArcher.text = SailorSliderValue(_sailorSliderArcher, _sailorMaxArchers).ToString();
+            if (_sailorValueKnight != null)
+                _sailorValueKnight.text = SailorSliderValue(_sailorSliderKnight, _sailorMaxKnights).ToString();
+        }
+
+        private static int SailorSliderValue(Slider slider, int max)
+        {
+            if (slider == null) return 0;
+            return Mathf.Clamp(Mathf.RoundToInt(slider.value), 0, Mathf.Max(0, max));
+        }
+
+        /// <summary>滑条镂空覆盖层随滑点同步：左边界落在滑点位置，左浅右暗。</summary>
+        private void UpdateSailorHollows()
+        {
+            SyncSailorHollow(_sailorHollowWorker, _sailorSliderWorker, ref _hollowWorkerValue);
+            SyncSailorHollow(_sailorHollowArcher, _sailorSliderArcher, ref _hollowArcherValue);
+            SyncSailorHollow(_sailorHollowKnight, _sailorSliderKnight, ref _hollowKnightValue);
+        }
+
+        private static void SyncSailorHollow(RectTransform overlay, Slider slider, ref float lastValue)
+        {
+            if (overlay == null || slider == null) return;
+            float v = Mathf.Clamp01(slider.normalizedValue);
+            if (Mathf.Approximately(v, lastValue)) return;
+            lastValue = v;
+            overlay.anchorMin = new Vector2(v, 0f);
+            overlay.anchorMax = new Vector2(1f, 1f);
+            overlay.offsetMin = Vector2.zero;
+            overlay.offsetMax = Vector2.zero;
+        }
+
+        /// <summary>确认选择：先关闭窗口恢复游戏，再按所选人数调整席位并执行原生摇铃。</summary>
+        private void ConfirmSailorSelect()
+        {
+            if (!_sailorOpen) return;
+            int workers = SailorSliderValue(_sailorSliderWorker, _sailorMaxWorkers);
+            int archers = SailorSliderValue(_sailorSliderArcher, _sailorMaxArchers);
+            int knights = SailorSliderValue(_sailorSliderKnight, _sailorMaxKnights);
+            CloseSailorWindow();
+            FeatureBehaviour.ConfirmBellSelection(workers, archers, knights);
+        }
+
+        private void CloseSailorWindow()
+        {
+            _sailorOpen = false;
+            IsOpen = false;
+            Time.timeScale = _prevTimeScale;
+            if (_sailorCanvasGo != null) _sailorCanvasGo.SetActive(false);
+            if (_eventSystemOurs && _eventSystemGo != null) _eventSystemGo.SetActive(false);
+            ReleaseCursor();
+        }
+
+        /// <summary>构建选人窗口（首次打开时执行一次，之后复用）。</summary>
+        private bool TryBuildSailorUi()
+        {
+            if (_sailorCanvasGo != null) return true;
+            try
+            {
+                if (!TryGetNativeAssets(out Button srcButton, out Font gameFont)) return false;
+                Image srcImage = srcButton.image;
+                Sprite frameSprite = srcImage != null ? srcImage.sprite : null;
+
+                _sailorCanvasGo = new GameObject("BetterKingdom.SailorSelect.Canvas");
+                _sailorCanvasGo.hideFlags = HideFlags.HideAndDontSave;
+                UnityEngine.Object.DontDestroyOnLoad(_sailorCanvasGo);
+                var canvas = _sailorCanvasGo.AddComponent<Canvas>();
+                canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+                canvas.sortingOrder = SailorCanvasSortOrder;
+                canvas.pixelPerfect = true;
+                var scaler = _sailorCanvasGo.AddComponent<CanvasScaler>();
+                scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+                scaler.referenceResolution = ReferenceResolution;
+                scaler.screenMatchMode = CanvasScaler.ScreenMatchMode.MatchWidthOrHeight;
+                scaler.matchWidthOrHeight = 0.5f;
+                _sailorCanvasGo.AddComponent<GraphicRaycaster>();
+
+                // 全屏遮罩（拦截游戏内点击）
+                GameObject backdropGo = new GameObject("Backdrop");
+                backdropGo.transform.SetParent(_sailorCanvasGo.transform, false);
+                var backdropRt = backdropGo.AddComponent<RectTransform>();
+                backdropRt.anchorMin = Vector2.zero;
+                backdropRt.anchorMax = Vector2.one;
+                backdropRt.offsetMin = Vector2.zero;
+                backdropRt.offsetMax = Vector2.zero;
+                backdropGo.AddComponent<Image>().color = BackdropColor;
+
+                // 面板边框：沿用设置窗口的九宫格边框精灵，尺寸包住面板 + 底栏
+                GameObject frameGo = new GameObject("Frame");
+                frameGo.transform.SetParent(_sailorCanvasGo.transform, false);
+                var frameRt = frameGo.AddComponent<RectTransform>();
+                var frameImg = frameGo.AddComponent<Image>();
+                if (frameSprite != null)
+                {
+                    frameImg.sprite = GetFlatSlotSprite(frameSprite);
+                    frameImg.type = Image.Type.Sliced;
+                }
+                frameImg.color = frameSprite != null ? FrameTintColor : FrameColor;
+                frameRt.anchorMin = frameRt.anchorMax = new Vector2(0.5f, 0.5f);
+                frameRt.pivot = new Vector2(0.5f, 0.5f);
+                frameRt.sizeDelta = new Vector2(SailorPanelWidth + SideBarWidth * 2f,
+                    SailorPanelHeight + TopBarHeight + BottomBarHeight);
+                frameRt.anchoredPosition = new Vector2(0f, (TopBarHeight - BottomBarHeight) * 0.5f);
+
+                // 面板
+                GameObject panelGo = new GameObject("Panel");
+                panelGo.transform.SetParent(_sailorCanvasGo.transform, false);
+                var panelRt = panelGo.AddComponent<RectTransform>();
+                var panelImg = panelGo.AddComponent<Image>();
+                if (frameSprite != null)
+                {
+                    panelImg.sprite = frameSprite;
+                    panelImg.type = frameSprite.border.sqrMagnitude > 0f ? Image.Type.Sliced : Image.Type.Simple;
+                }
+                panelImg.color = PanelColor;
+                panelRt.anchorMin = panelRt.anchorMax = new Vector2(0.5f, 0.5f);
+                panelRt.pivot = new Vector2(0.5f, 0.5f);
+                panelRt.sizeDelta = new Vector2(SailorPanelWidth, SailorPanelHeight);
+
+                // 标题（写在上边框栏内）
+                GameObject titleGo = new GameObject("Title");
+                titleGo.transform.SetParent(panelGo.transform, false);
+                var titleRt = titleGo.AddComponent<RectTransform>();
+                var title = titleGo.AddComponent<Text>();
+                title.font = ResolveSailorFont("选择随行人数", gameFont);
+                title.text = "选择随行人数";
+                title.fontSize = 44;
+                title.alignment = TextAnchor.MiddleCenter;
+                title.color = Color.white;
+                title.horizontalOverflow = HorizontalWrapMode.Overflow;
+                title.verticalOverflow = VerticalWrapMode.Overflow;
+                titleRt.anchorMin = titleRt.anchorMax = new Vector2(0.5f, 1f);
+                titleRt.pivot = new Vector2(0.5f, 0.5f);
+                titleRt.sizeDelta = new Vector2(SailorPanelWidth - 40f, TopBarHeight);
+                titleRt.anchoredPosition = new Vector2(0f, TopBarHeight * 0.5f);
+
+                // 三行：工人 / 弓箭手 / 骑士小队
+                float rowWidth = SailorPanelWidth - SailorRowMargin * 2f;
+                BuildSailorRow(panelGo.transform, 0, "工人", rowWidth, frameSprite, gameFont,
+                    out _sailorSliderWorker, out _sailorValueWorker, out _sailorHollowWorker);
+                BuildSailorRow(panelGo.transform, 1, "弓箭手", rowWidth, frameSprite, gameFont,
+                    out _sailorSliderArcher, out _sailorValueArcher, out _sailorHollowArcher);
+                BuildSailorRow(panelGo.transform, 2, "骑士小队", rowWidth, frameSprite, gameFont,
+                    out _sailorSliderKnight, out _sailorValueKnight, out _sailorHollowKnight);
+
+                // 底部只保留一个“确定”按钮，横向铺满底栏
+                float btnWidth = SailorPanelWidth - BottomButtonMargin * 2f;
+                var btnSize = new Vector2(btnWidth, BottomButtonHeight);
+                Button confirmBtn = BuildMenuButton(panelGo.transform, srcButton, "确定", ConfirmSailorSelect,
+                    ResolveSailorFont("确定", gameFont), btnSize);
+                float btnY = -(BottomBarHeight * 0.5f);
+                var confirmRt = confirmBtn.GetComponent<RectTransform>();
+                confirmRt.anchoredPosition = new Vector2(0f, btnY);
+                // “确定”二字略向下移：取消按钮文本默认的视觉上移量（其余按钮不受影响）
+                Text confirmLabel = _lastButtonLabel;
+                if (confirmLabel != null)
+                {
+                    confirmLabel.rectTransform.offsetMin = Vector2.zero;
+                    confirmLabel.rectTransform.offsetMax = Vector2.zero;
+                }
+
+                _sailorCanvasGo.SetActive(false);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>构建一行：职业名 + 原生样式滑条 + 人数数值。</summary>
+        private void BuildSailorRow(Transform panelTransform, int index, string label, float rowWidth,
+            Sprite slotSprite, Font fallbackFont, out Slider slider, out Text valueText, out RectTransform hollow)
+        {
+            slider = null;
+            valueText = null;
+            hollow = null;
+            // 职业名与人数分开校验字形：游戏原生字体通常没有数字字形，混在一起会把职业名也拖回系统字体
+            Font uiFont = ResolveSailorFont(label, fallbackFont);
+            Font numFont = ResolveSailorFont("0123456789", fallbackFont);
+
+            GameObject rowGo = new GameObject("SailorRow_" + label);
+            rowGo.transform.SetParent(panelTransform, false);
+            var rowRt = rowGo.AddComponent<RectTransform>();
+            rowRt.anchorMin = rowRt.anchorMax = new Vector2(0.5f, 1f);
+            rowRt.pivot = new Vector2(0.5f, 1f);
+            rowRt.sizeDelta = new Vector2(rowWidth, SailorRowHeight);
+            rowRt.anchoredPosition = new Vector2(0f, -(SailorRowsTop + index * (SailorRowHeight + SailorRowGap)));
+            var rowImg = rowGo.AddComponent<Image>();
+            // 纯色平铺（无九宫格边框），三行同色相接
+            if (slotSprite != null) rowImg.sprite = GetRowFlatSprite(slotSprite);
+            rowImg.color = RowBgColor;
+
+            // 行间细线（最后一行不画）：同一底色块内用一条半透明细线分隔
+            if (index < 2)
+            {
+                GameObject lineGo = new GameObject("Separator");
+                lineGo.transform.SetParent(rowGo.transform, false);
+                var lineRt = lineGo.AddComponent<RectTransform>();
+                lineRt.anchorMin = new Vector2(0f, 0f);
+                lineRt.anchorMax = new Vector2(1f, 0f);
+                lineRt.pivot = new Vector2(0.5f, 0f);
+                lineRt.sizeDelta = new Vector2(0f, SailorSeparatorHeight);
+                lineRt.anchoredPosition = Vector2.zero;
+                lineGo.AddComponent<Image>().color = SailorSeparatorColor;
+            }
+
+            // 职业名
+            GameObject labelGo = new GameObject("Label");
+            labelGo.transform.SetParent(rowGo.transform, false);
+            var labelRt = labelGo.AddComponent<RectTransform>();
+            var labelTxt = labelGo.AddComponent<Text>();
+            if (uiFont != null) labelTxt.font = uiFont;
+            labelTxt.text = label;
+            labelTxt.fontSize = SailorLabelFontSize;
+            labelTxt.alignment = TextAnchor.MiddleLeft;
+            labelTxt.color = new Color(1f, 1f, 1f, 0.92f);
+            labelTxt.horizontalOverflow = HorizontalWrapMode.Overflow;
+            labelTxt.verticalOverflow = VerticalWrapMode.Overflow;
+            labelRt.anchorMin = new Vector2(0f, 0f);
+            labelRt.anchorMax = new Vector2(0f, 1f);
+            labelRt.pivot = new Vector2(0f, 0.5f);
+            labelRt.sizeDelta = new Vector2(SailorLabelWidth, 0f);
+            labelRt.anchoredPosition = new Vector2(SailorRowPadding, 0f);
+
+            // 人数数值（滑条右侧实时显示）
+            GameObject valueGo = new GameObject("Value");
+            valueGo.transform.SetParent(rowGo.transform, false);
+            var valueRt = valueGo.AddComponent<RectTransform>();
+            valueText = valueGo.AddComponent<Text>();
+            if (numFont != null) valueText.font = numFont;
+            valueText.fontSize = SailorLabelFontSize + 2;
+            valueText.alignment = TextAnchor.MiddleRight;
+            valueText.color = SailorValueColor;
+            valueText.horizontalOverflow = HorizontalWrapMode.Overflow;
+            valueText.verticalOverflow = VerticalWrapMode.Overflow;
+            valueRt.anchorMin = new Vector2(1f, 0f);
+            valueRt.anchorMax = new Vector2(1f, 1f);
+            valueRt.pivot = new Vector2(1f, 0.5f);
+            valueRt.sizeDelta = new Vector2(SailorValueWidth, 0f);
+            valueRt.anchoredPosition = new Vector2(-SailorRowPadding, 0f);
+
+            // 滑条容器（夹在职业名与数值之间）
+            GameObject sliderAreaGo = new GameObject("SliderArea");
+            sliderAreaGo.transform.SetParent(rowGo.transform, false);
+            var sliderAreaRt = sliderAreaGo.AddComponent<RectTransform>();
+            sliderAreaRt.anchorMin = Vector2.zero;
+            sliderAreaRt.anchorMax = Vector2.one;
+            sliderAreaRt.offsetMin = new Vector2(SailorRowPadding + SailorLabelWidth + 18f, SailorRowHeight * 0.5f - 15f);
+            sliderAreaRt.offsetMax = new Vector2(-(SailorRowPadding + SailorValueWidth + 18f), -(SailorRowHeight * 0.5f - 15f));
+
+            slider = BuildSailorSlider(sliderAreaGo.transform, slotSprite, out hollow);
+        }
+
+        /// <summary>构建滑条：自建轨道/镂空覆盖层/滑点（外观见 BuildSailorSliderBody）。</summary>
+        private Slider BuildSailorSlider(Transform parent, Sprite slotSprite, out RectTransform hollow)
+        {
+            // 不再克隆原生音量滑条：原生轨道是近黑色细条，做不出“整条带黑边”的开关按钮样式
+            Slider slider = BuildSailorSliderBody(parent, slotSprite, out hollow);
+            if (slider != null)
+            {
+                var rt = slider.GetComponent<RectTransform>();
+                rt.anchorMin = Vector2.zero;
+                rt.anchorMax = Vector2.one;
+                rt.offsetMin = Vector2.zero;
+                rt.offsetMax = Vector2.zero;
+                rt.localScale = Vector3.one;
+            }
+            return slider;
+        }
+
+        /// <summary>自建滑条：轨道整条带黑边（同设置窗口开关按钮），滑点右侧轨道面被暗色镂空覆盖，左侧保留原本样式。</summary>
+        private static Slider BuildSailorSliderBody(Transform parent, Sprite slotSprite, out RectTransform hollow)
+        {
+            hollow = null;
+            GameObject rootGo = new GameObject("Slider");
+            rootGo.transform.SetParent(parent, false);
+            var rootRt = rootGo.AddComponent<RectTransform>();
+            rootRt.anchorMin = Vector2.zero;
+            rootRt.anchorMax = Vector2.one;
+            rootRt.offsetMin = Vector2.zero;
+            rootRt.offsetMax = Vector2.zero;
+            rootRt.localScale = Vector3.one;
+            var slider = rootGo.AddComponent<Slider>();
+            slider.direction = Slider.Direction.LeftToRight;
+
+            // 轨道
+            GameObject trackGo = new GameObject("Background");
+            trackGo.transform.SetParent(rootGo.transform, false);
+            var trackRt = trackGo.AddComponent<RectTransform>();
+            trackRt.anchorMin = new Vector2(0f, 0.5f);
+            trackRt.anchorMax = new Vector2(1f, 0.5f);
+            trackRt.pivot = new Vector2(0.5f, 0.5f);
+            trackRt.sizeDelta = new Vector2(0f, 24f);
+            trackRt.anchoredPosition = Vector2.zero;
+            var trackImg = trackGo.AddComponent<Image>();
+            // 轨道整条铺满并保留九宫格边框（深色描边 + 浅色面），外观同设置窗口开关按钮
+            if (slotSprite != null)
+            {
+                trackImg.sprite = GetFlatSlotSprite(slotSprite);
+                trackImg.type = Image.Type.Sliced;
+            }
+            trackImg.color = ButtonTintColor;
+
+            // 镂空覆盖层容器：内缩一圈后只作用于轨道内部，边框仍由上面的九宫格描边构成（不放任何图形）
+            GameObject innerGo = new GameObject("Inner");
+            innerGo.transform.SetParent(rootGo.transform, false);
+            var innerRt = innerGo.AddComponent<RectTransform>();
+            innerRt.anchorMin = Vector2.zero;
+            innerRt.anchorMax = Vector2.one;
+            innerRt.offsetMin = new Vector2(SailorSliderHollowInset, SailorSliderHollowInset);
+            innerRt.offsetMax = new Vector2(-SailorSliderHollowInset, -SailorSliderHollowInset);
+
+            // 镂空覆盖层：暗色块，左边界由滑点位置驱动（滑点左侧露出轨道原本样式）
+            GameObject hollowGo = new GameObject("Hollow");
+            hollowGo.transform.SetParent(innerGo.transform, false);
+            hollow = hollowGo.AddComponent<RectTransform>();
+            hollow.anchorMin = Vector2.zero;
+            hollow.anchorMax = Vector2.one;
+            hollow.offsetMin = Vector2.zero;
+            hollow.offsetMax = Vector2.zero;
+            hollowGo.AddComponent<Image>().color = SailorSliderEmptyColor;
+
+            // 手柄区
+            GameObject handleAreaGo = new GameObject("Handle Slide Area");
+            handleAreaGo.transform.SetParent(rootGo.transform, false);
+            var handleAreaRt = handleAreaGo.AddComponent<RectTransform>();
+            handleAreaRt.anchorMin = Vector2.zero;
+            handleAreaRt.anchorMax = Vector2.one;
+            handleAreaRt.offsetMin = new Vector2(13f, 0f);
+            handleAreaRt.offsetMax = new Vector2(-13f, 0f);
+
+            GameObject handleGo = new GameObject("Handle");
+            handleGo.transform.SetParent(handleAreaGo.transform, false);
+            var handleRt = handleGo.AddComponent<RectTransform>();
+            handleRt.anchorMin = new Vector2(0f, 0f);
+            handleRt.anchorMax = new Vector2(0f, 1f);
+            handleRt.pivot = new Vector2(0.5f, 0.5f);
+            handleRt.sizeDelta = new Vector2(26f, 0f);
+            var handleImg = handleGo.AddComponent<Image>();
+            // 滑点直接用原生按钮精灵（与"确定"按钮同款九宫格），带黑边
+            if (slotSprite != null)
+            {
+                handleImg.sprite = slotSprite;
+                handleImg.type = slotSprite.border.sqrMagnitude > 0f ? Image.Type.Sliced : Image.Type.Simple;
+            }
+            handleImg.color = ButtonTintColor;
+
+            slider.handleRect = handleRt;
+            slider.targetGraphic = handleImg;
+            slider.minValue = 0f;
+            slider.maxValue = 1f;
+            slider.wholeNumbers = true;
+            slider.value = 0f;
+            return slider;
         }
 
         /// <summary>

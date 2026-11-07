@@ -84,6 +84,10 @@
    - **地图范围绝不能包含任何可开关的地图标记**（传送门/营地/宝箱等），否则开关选项会改变整图比例。
    - **洞窟侧地面会延伸进悬崖内部**（洞窟 `BombablePortal` 距离该侧原始边界 64~100 单位，另一侧则几乎贴边，如岛3 右边界 210 而灯塔在 209.25），
      所以显示范围要在该侧按洞窟位置裁掉，否则那一侧留空明显。裁剪只做一次并缓存（洞窟被炸后不回弹）。
+   - **洞窟坐标必须按关卡隔离**：换关卡（`TryGetWorldBounds` 检测到原始边界变化）时立即 `_caveX.Clear()` + `_caveRetryScans=0` + `_nextCaveScan=Time.unscaledTime`，
+     否则会用上一岛的洞窟坐标裁剪新图——裁错侧会出现「洞窟标记在画面外/看不到洞窟」，或把悬崖侧空白保留下来。
+     新关卡还没扫到洞窟时用 `CaveScanRetryInterval`(2.5s) 快速重扫（最多 `CaveScanMaxRetries` 8 次），找到后立即置 `_nextHeavyRefresh=0` 触发一次重刷新以便尽快裁剪。
+   - **每岛裁剪结果缓存** `_islandTrimCache`（键 = `_rawBoundLeft/_rawBoundRight` 取整）：洞窟被炸毁后重进该岛、扫不到洞窟坐标时直接复用上次裁剪值，避免悬崖侧空白重新出现。
 2. **换日在午夜 0 点**：`Director.Update` 中当 `currentTime >= 24` 时 `TotalDaysInReign++`、`currentTime -= 24`，同时写 `CurrentSeason` 与 `CampaignSaveData.TotalGameDays`。
    → 需求“季节日改为早上更新”只能在显示层做偏移：`currentTime < 白天起点(dayStart≈5)` 时显示前一天。
 3. **季节是数据驱动的，默认每季 16 天**：资源 `SeasonData_Default` 每季 `TotalNumDays = 14 regular + 1 boss(血月) + 1 recovery = 16`，一年 4 季共 64 天。
@@ -116,14 +120,19 @@
 7. **钱袋与国库共通**：真实国库账本是 `Banker._stashedCoins`（存档走 `BankerData.stashedCoins`）；
    `Castle._currentCoinCount` 只是城堡金币堆的显示镜像（`SendStashCount`/`RecvStashCount` RPC 同步，`Castle.stash` + `stashHeight` 按数量画高度），**不参与存档**。
    因此国库未解锁（场景里没有 `Banker`）时整个联动必须关闭，否则溢出金币写进显示字段会丢失、取款还会凭空造币。判定入口：`_cachedBanker == null` 直接 return。
-8. **付费攻门小队优先级**：入口是 `PayableBorder.Pay()`（玩家付费后由 `Payable.PerformPay()` 虚调用），原版在 `Kingdom.Knights` 哈希集上遍历，只按 `Knight.numArchers` 取最大，人数相同则"后遍历者"胜出（顺序随机），不看 `_wasPromoted`。
-   模组做法：`PayableBorder.Pay` Prefix 里按 `CanCharge()` + `|kx-border.x| <= knightRange` 筛出候选，排序键为 人数 > `_wasPromoted` > 距离更近，记下实例 ID；同期间 `Knight.CanCharge` Postfix 只放行该 ID，使原版循环必然选中它；Postfix 清理上下文。计算候选时用 `_chargePicking` 标志绕过 `CanCharge` 自身过滤，避免递归。
+8. **付费攻门小队优先级**：入口是 `PayableBorder.Pay()`（玩家付费后由 `Payable.PerformPay()` 虚调用），原版在 `Kingdom.Knights` 哈希集上遍历，只按 `Knight.numArchers` 取最大，人数相同则"后遍历者"胜出（顺序随机），不看骑士等级。
+   模组做法：`PayableBorder.Pay` Prefix 里按 `CanCharge()` + `|kx-border.x| <= knightRange` 筛出候选，排序键为 人数 > 高级骑士 > 距离更近，记下实例 ID；同期间 `Knight.CanCharge` Postfix 只放行该 ID，使原版循环必然选中它；Postfix 清理上下文。计算候选时用 `_chargePicking` 标志绕过 `CanCharge` 自身过滤，避免递归。
+   **高级骑士判定必须用 tag，不能用 `_wasPromoted`**：该字段只在 `Knight.OnKnightPromote` 里把被替换下场的旧侍从置 1（随后旧对象被 `Character.Promote` 回收），且 `Knight.OnEnable` 会清零，活着的晋升骑士恒为 false。游戏用 GameObject tag 区分：侍从 `Squire`、晋升骑士 `Knight`（`Character.Promote`/`Demote` 的 `CompareTag` 可证）。统一走 `FeatureBehaviour.IsAdvancedKnight(k)`。
    小队人数 = `Knight._archers` 的 `Count`（`numArchers`），上限 `_maxArchers`（prefab 值 4）；`_numAdditionalChargeFollowers` 是冲锋时招募狂战士的参数，不是人数依据。
 9. **周期刷新不能同帧叠加**：`FeatureBehaviour` 与 `MapOverlayBehaviour` 的各周期任务（进攻检测、缓存、墙体修正、洞窟/油桶/农田全场景扫描、中/重刷新）
     共用同一个“本帧唯一重型槽位” `FeatureBehaviour.TryReserveHeavySlot()`（按 `Time.frameCount` 记账）：抢不到槽位的任务**不重置计时器**，顺延到后续帧。
-    各任务周期（0.2s~10s）都远大于一帧，因此不会饿死；安全检测放在 Update 最前，优先拿槽位。
+    槽位还要求相邻两个重型任务之间至少空出 `HeavySlotGapFrames`(1) 帧，把重活摊平到多帧，避免连续帧都压着重任务形成卡顿。
+    各任务周期都远大于一帧，因此不会饿死；安全检测放在 Update 最前，优先拿槽位。
     `Awake` 里按不同相位初始化计时器（0/0.1/0.5/0.6/0.7s），避免首帧全部到期后连续多帧排队。每帧仍照常执行的任务只有 `UpdatePurseTreasuryLink`、`SyncWallQueueSwitch`、`EnsureTimeNotStuck`（都很轻且需要帧级/秒级精度）。
-10. **玩家最高移速 5.8（功能设置页开关「玩家移动速度提升」）**：原版奔跑约 4.29（实测 4.28~4.30 浮动）。开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（4Hz）里执行：
+    **总体节奏（2026-11 调优后）**：进攻检测 0.3s、缓存 0.5s、禁用排队复钳 1s（分配补丁已即时复钳，这里只兜底）、就近改派 1s、墙体纠错 3s（墙体边界 5s 重建）。地图覆盖层：轻刷新 20Hz、中刷新 2Hz、重刷新 3s、油桶 8s、农田 5s；驻守侧改派已改为事件驱动（传送门摧毁/工人启用/SetWorkerSide/换岛），无周期扫描；洞窟、城堡、坐骑、科技点均按“本岛只采集一次”缓存（换岛由 `ResetIslandCaches` 清空）。
+    `RebalanceQueuedWork` 先筛一次空闲候选池（`_balanceIdleBuffer`/`_balanceIdleX`），内层只做浮点距离比较；原实现逐工作重复查询全部工人状态是 O(n²) 互操作，是卡顿来源之一。
+    `FixWallDefensePositions` 不再重复调用 `DisableWallQueueing`（避免与 1s 复钳重复劳动），墙体碰撞体只在 `WallBoundsScanInterval`(5s) 或换岛时重建。
+10. **玩家最高移速 5.8（功能设置页开关「玩家移动速度提升」）**：原版奔跑约 4.29（实测 4.28~4.30 浮动）。开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（2Hz）里执行：
     ①`player.steed.runSpeed` 不足 `PlayerRunSpeedCap`(5.8) 时写 5.8，并用 `_boostedSteeds` 记录每个坐骑改动前的原值（同一坐骑只记一次）；
     ②`player.mover._moveSpeed` 落在 [4,5.8) 时抬到 5.8（让当前正在跑的这一段立刻生效）。
     关闭开关时按记录把 `runSpeed` 还原、并把精确等于 5.8 的 `_moveSpeed` 退回原值，无需重启游戏。
@@ -131,6 +140,28 @@
 11. **摇铃立即上船必须延后一帧**（`EmbarkeeInstantBoardPatch`）：不能在 `Embarkee.SetEmbarkableTarget` 的 Postfix 里直接 `Embark()`。
     读档/回岛时 `Boat.ApplyData` / `LoadLegacyEmbarkees` 的恢复顺序是 `StopInert → SetEmbarkableTarget → 游戏自己 Embark()`，Postfix 抢先调用会让同一单位 `Embark` 两次；`Embark()` 先置 `IsEmbarked=true` 再申请座位，重复调用会重复占座，下船时同一单位被处理两次，导致整船 4 弓箭手 + 3 工人卡在码头原地动画，只有重开游戏才恢复。
     正确做法：Postfix 只把单位加入 `FeatureBehaviour._pendingInstantBoards`，Update 下一帧检查 `!IsEmbarked` 且目标仍是船后才 `Embark()`；加载期间（`IsOverlayVisible()==false`）直接清空队列。
+12. **摇铃选人窗口（`BoatSummonBellSelectPatch`）**：付钱摇铃链路是 `BoatSummoningBell.Pay → Boat.OnBoatSummonBellRang → ToggleAllBoardingPermissions(true) → EmbarkableRegistrar.DistributeEmbarkeesOfType → Embarkee.SetEmbarkableTarget`，分配在 `OnBoatSummonBellRang` 内同步完成。
+    `Boat.ApplyData`（读档/回岛恢复乘客）也会调用 `OnBoatSummonBellRang`，所以只用 `BoatSummoningBell.Pay` Prefix/Postfix 的 `_bellSummonFromPay` 标志区分"付钱摇铃"与"读档恢复"，后者不弹窗。
+    席位注册在 `Boat.OnEnable`：`RegisterUnitSlots<Knight>(maxKnights=3)`、`Worker(maxWorkers=3)`、`Archer(_archerPositions.Length=4)`、Pikemen/Farmers 视解锁条件；`RegisterUnitSlots` 对已注册的 embarkable 直接返回，因此扩容必须直接操作 `Embarkable._slots` 里的 `List<EmbarkeeSlot>`（`new EmbarkeeSlot(embarkable, type, id)`），缩容只删尾部**空**席位。
+    骑士随从弓箭手以 Stowaway（`slotId=-1`，`Embarkee.IsStowaway`）随骑士上船，**不占弓箭手席位**，弓箭手席位只按自由弓箭手数量调整。
+    `Boat.TryGetEmbarkPosition` 对 Archer 用 `_archerPositions[slotId]`，slotId 越界时回退到甲板随机位置；工人/骑士一直用甲板随机位置，所以额外席位不会造成站位越界崩溃。
+    读档恢复时所有乘客都以 `slotId=-1` 重新上船（`Boat.ApplyData`），与船的席位数量无关，因此本次扩容不会带到下一座岛。
+    窗口 UI 用独立 Canvas（sortingOrder 5100）：三行按面板高度 1/3 平分、无缝相接（`SailorRowHeight = SailorPanelHeight/3`、行距/顶距 0）；行背板用 `GetRowFlatSprite`（取按钮精灵内部单像素做 1×1 纯色精灵），不保留九宫格边框，整块颜色一致；`SailorRowMargin=0` 让行铺满面板，盖住面板九宫格两侧深色边；行间用 2px 半透明黑细线 `Separator` 分隔（末行不画）。
+    滑条为完全自建（`BuildSailorSlider → BuildSailorSliderBody`，不克隆原生音量滑条）：轨道整条 24 高，用 `GetFlatSlotSprite` + Sliced + `ButtonTintColor`（深色描边+浅色面，外观同设置窗口开关按钮）；「镂空」用覆盖层实现——`Inner` 容器内缩 `SailorSliderHollowInset`(6) 只覆盖轨道内部，其子物体 `Hollow`（纯色 `SailorSliderEmptyColor`）的 `anchorMin.x` 由滑点值驱动（`UpdateSailorHollows/SyncSailorHollow` 在 `UpdateSailorWindow` 与 `ApplySailorLimits` 中同步），从而滑点左侧露出轨道原本样式、右侧为暗色镂空；不用 `Slider.fillRect`（不设填充，Slider 只负责驱动 handle）。滑点宽 26，直接用原生按钮精灵（border 为 0 时退 Simple）+ `ButtonTintColor`，与「确定」按钮同款。
+    「确定」按钮文本在 `BuildMenuButton` 后把 `_lastButtonLabel` 的 offsetMin/offsetMax 归零，取消默认视觉上移量（二字略向下）。
+    字体走 `ResolveSailorFont`：按整串字符用 `Font.HasCharacter` 校验，依次尝试 `Language.current` 的 menuFont/menuSmallFont/menuAltFont/regularFont/bigTextFont（游戏原生字体），全部不覆盖才回退 `ResolveUIFont` 的系统字体，避免位图字体缺字空白。**汉字与数字必须分开校验**（`uiFont` 查职业名、`numFont` 查 "0123456789"），位图字体通常无数字字形，混在一起会把职业名也拖回系统字体。
+13. **税官（Banker）解析必须共享限频**：`FindObjectsByType<Banker>(FindObjectsInactive.Include)` 是全场景遍历。此前 `FeatureBehaviour.RefreshCaches` 与 `MapOverlayBehaviour` 中频刷新各在缓存为空时每 0.25s 扫一次（合计约 8 次/秒），是周期性卡顿的来源。
+    现统一走 `FeatureBehaviour.ResolveBanker(kingdom)`：优先 `kingdom.banker`，缓存失效才场景查找，且按 `BankerScanInterval`(3s) 限频、换岛自动失效。
+14. **钱袋取款跟手**：`HandlePurseLink` 只在**松开支付键**时重置长按计时；袋里有币时不再清零（只保留已累计时间）。这样按住支付键移动、钱袋被花空的瞬间就能取款，不再等 0.25s 阈值；短点击（未达阈值）仍不会取款。
+15. **传送门被毁后的驻守侧改派**：`Worker._targetSide`（偏移 388）只影响 `Worker.Behaviour` 的 Shelter 分支（用 `Kingdom.GetBorderSideIntact(_targetSide)` 取该侧城墙内侧避难点），改它不会影响工作/移动/接活。
+    判据用 `Kingdom.closestPortal : Sided<Portal>` 的 `.left/.right`：传送门 `Crumble` 会 `RemovePortal` 并销毁对象，`FindClosestPortals` 随即把该侧置 null。仅当“恰好一侧为 null、另一侧非 null”时，把该侧工人的 `_targetSide` 翻到另一侧；两侧都无传送门时不动。
+    改派已改为**事件驱动、写入即写死**，不再周期扫描工人：`PortalCrumbleStationSidePatch`（`Portal.Crumble` Postfix）置 `_stationSideDirty` 让下一帧全量处理一次；
+    `WorkerStationSideOnEnablePatch`（`Worker.OnEnable` Postfix，新生成/读档恢复/重新启用）与 `WorkerStationSideSetPatch`（`Worker.SetWorkerSide` Postfix，游戏改写所属侧）即时写死单个工人；换岛（`TrackKingdomChange`）也置一次脏标记。
+    `_targetSide` 的原生写入点只有 `Worker.OnEnable`（按城堡位置取符号）和 `Worker.SetWorkerSide` 两处，因此上述挂钩可以完全替代周期扫描。
+16. **骑士拿取铁剑（盔甲）途中不得被“回城墙”打断**：`Knight.State` 有 `GrabArmor` 状态，其守卫是 `ShouldGrabArmor()` = `_targetArmor != null`（`_targetArmor` = 偏移 392，剑/盾掉落实体）。
+    “回城墙”的目标站位由 `Knight.GetTargetPos()`（读 `rank` 376、`Kingdom.GetGuardPosition`）推导，状态机在行走途中反复评估 `ShouldGoToWall()`；一旦成立就切到 `GoToWall`，中断 `GrabArmor` 协程（`<GrabArmor>d__162.MoveNext` 途中停止，骑士掉头回墙）。
+    修复：`KnightKeepArmorGrabPatch` Prefix 在 `_targetArmor != null` 时强制 `ShouldGoToWall` 返回 false（拿到铁剑、目标清空后恢复原生判定）；同时 `DisableWallQueueing` 跳过这类骑士，不改它们的 `rank`。
+    `ShouldGoToWall` 没有直接调用者，它是 `StateMachine.AddTransition` 的条件委托（`Archer.ShouldGoToWall(Side)` 是弓箭手的重载，别混淆）。
 
 ## 5. 未知字段/方法怎么查（逆向工具链）
 
@@ -219,9 +250,9 @@ csproj 需引用：`Cpp2IL.Core`、`LibCpp2IL`、`AssetRipper.Primitives`、`Ass
 
 ## 7. 显示刷新节奏（`MapOverlayBehaviour.Update`）
 
-- 轻刷新 50Hz：玩家位置、怪物竖线/血条、作物条。
-- 中刷新 4Hz：时间/季节、金币、职业统计。
-- 重刷新 2s（或开关变化触发）：地图标记列表、世界边界、悬停动画清理。
+- 轻刷新 20Hz：玩家位置、怪物竖线/血条、作物条（原 50Hz，纯 CPU 浪费，20Hz 视觉上仍平滑）。
+- 中刷新 2Hz：时间/季节、金币、职业统计。
+- 重刷新 3s（或开关变化触发）：地图标记列表、世界边界（换岛比对后沿用缓存）、悬停动画清理；油桶 8s、农田 5s；洞窟/城堡/坐骑/科技点按本岛一次采集（洞窟未采到前 2.5s 快速重试，最多 8 次）。科技点解锁后只按已记录对象名移除标记，不做全场景重扫。
 - 世界边界与标记列表只在重刷新里更新；`_hoverAnim` **不要每次重刷新清空**（否则悬停标记会周期性缩回再放大），仅在数量 > 512 时清理。
 - 怪物竖线：按 `waveID` 用 `Dictionary<uint, WaveGroup>` 跨帧保留平滑位置与侧别；每帧重算 Min/Max，侧别带 2 只滞回，`Shown` 以 50 世界单位/秒 `MoveTowards` 目标。
 
@@ -231,4 +262,10 @@ csproj 需引用：`Cpp2IL.Core`、`LibCpp2IL`、`AssetRipper.Primitives`、`Ass
 2. **删除临时搭建的逆向工具**：`%TEMP%\cpp2ilprobe`、`%TEMP%\cecildump`、`%TEMP%\probe*.txt`、`%TEMP%\cecil_out.txt` 等，不在工程内留反编译工具或产物。
 3. 设置窗口只做 UI 与开关状态；业务逻辑放对应功能文件，显示逻辑放 `MapOverlayBehaviour.cs`。
 4. 编译后必须确认已部署到游戏插件目录，再请用户进游戏验证并核对 `Player.log`。
+
+## 9. 工人避险与工作分配（已确认）
+
+- 行为状态选择在 `Worker+<>c__DisplayClass111_0::<Behaviour>b__0`：**Work(2) 优先于 Shelter**。工人有 `_currentWork`(+192) 或 `_queuedWork`(+200) 时，即使 `ShouldShelter` 返回真也不会回城，必须先卸掉工作（`ResetWorkState(false)` 会释放当前工作位并触发一次 `Kingdom.ReassignWork`）。
+- 工作分配链路：`Kingdom.ReassignWork → Kingdom+ActorTracker<Workable,Worker>::Reassign → JobAssigner.Compute`。尚未开工的工作保存在工人 `_queuedWork`，开工时由 `SetCurrentWork` 转成 `_currentWork`。
+- 就近改派只能动 `_queuedWork`（未开工），用游戏接口 `Workable.CancelWork(worker)` + `Worker.AssignJob(job)` 完成转移；不要直接改 `_currentWork` 打断正在进行的活。
 

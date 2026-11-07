@@ -22,12 +22,19 @@ namespace BetterKingdom
         private const float LineThickness = 6f;
         private const float LeftMargin = 16f;
         private const float RightMargin = 260f;
-        private const float LightRefreshInterval = 0.02f;
-        private const float MediumRefreshInterval = 0.25f;
-        private const float HeavyRefreshInterval = 2f;
-        private const float OilScanInterval = 4f;    // 火油桶统计间隔（全场景扫描，与 2 秒重刷新错峰）
-        private const float CaveScanInterval = 10f;  // 洞窟位置扫描间隔（洞窟是静态对象，只在炸毁时变化）
-        private const float FarmScanInterval = 2f;   // 农田引用重建间隔（原先 0.25 秒一次全场景扫描过重）
+        //   刷新节奏（与 FeatureBehaviour 的重型槽位共用：同一帧最多一个重型任务、且至少隔一帧）  
+        // 轻量：玩家位置/怪物连线/血条，20Hz 足够且视觉平滑（原 50Hz 是纯 CPU 浪费）。
+        // 中频：数值统计类（职业人数/国库/农田），2Hz 足够。
+        // 重型：墙体/箭塔/传送门/额外标记，3 秒一次；额外的全场景扫描进一步拉长间隔并彼此错峰。
+        private const float LightRefreshInterval = 0.1f;
+        private const float MediumRefreshInterval = 0.5f;
+        private const float HeavyRefreshInterval = 3f;
+        private const float OilScanInterval = 15f;   // 火油桶统计间隔（全场景扫描，仅在职业面板开启时执行）
+        private const float CaveScanRetryInterval = 2.5f;  // 洞窟坐标未采到前的快速重扫间隔（洞窟对象可能晚于边界创建）
+        private const int CaveScanMaxRetries = 8;    // 快速重扫次数上限（用尽后本岛不再扫描）
+        private const float FarmScanInterval = 20f;  // 农田引用重建间隔（静态关卡对象，全场景扫描不宜过密）
+        private const float HouseScanInterval = 20f; // 民房（重建难民营）全场景扫描间隔
+        private const float WallSiteRescanInterval = 30f;  // 城墙建造位候选列表重建间隔
         private const float DotRadius = 7f;
         private const int EnemySideHysteresis = 2;         // 侧别切换滞回（多数侧需多出该数量才切换）
         private const int LabelFontSize = 18;
@@ -68,7 +75,8 @@ namespace BetterKingdom
         private struct WorldBar { public Vector3 Pos; public float Frac; }
         private readonly List<WorldBar> _hpBars = new();       // 怪物血条（轻刷新重建）
         private readonly List<WorldBar> _cropBars = new();     // 作物进度条（轻刷新重建）
-        private readonly List<Farmland> _farmlands = new();    // 农田引用缓存（中频重建，低频读进度）
+        private readonly List<Farmland> _farmlands = new();    // 农田引用缓存（低频重建，高频只读进度）
+        private readonly List<Vector3> _farmlandPos = new();   // 农田世界坐标缓存（农田不会移动，避免轻刷新反复读 transform）
         private Camera _cachedCam;       // 世界转屏幕用的相机缓存（中频重建；Camera.main 在本游戏为 null，需遍历兜底）
         // 世界悬浮条尺寸与头顶偏移（屏幕像素/世界单位）
         private const float HpBarWidth = 80f, HpBarHeight = 10f;      // 怪物血条
@@ -88,13 +96,33 @@ namespace BetterKingdom
         // 关卡地面原始边界 + 洞窟侧裁剪标记：地面会延伸到悬崖内部，只按洞窟坐标裁剪一次，洞窟被炸后不再回弹
         private float _rawBoundLeft, _rawBoundRight;
         private bool _caveTrimmed;
+        private int _caveRetryScans;   // 新关卡洞窟坐标未找到时的快速重扫计数
+        // 每岛洞窟侧裁剪结果（键 = 地面原始边界）：洞窟被炸毁后重进该岛时仍按原裁剪值绘制，避免悬崖侧空白重现
+        private static readonly Dictionary<(long, long), Vector2> _islandTrimCache = new();
         private bool _boundsReady;
         private bool _hasData;
+        private bool _caveScanned;      // 本岛洞窟坐标是否已采集（采集一次后本岛不再扫描）
+        private bool _mountsScanned;    // 本岛坐骑出生点是否已采集（采集一次后本岛不再扫描）
+        private bool _techScanned;      // 本岛科技点是否已采集（采集一次后本岛不再扫描）
+        private readonly List<Payable> _techSources = new();  // 科技点标记对应的原始对象（用于解锁后移除标记，不做全场景重扫）
+        // 雕像/宝箱：本岛只做一次全场景扫描，之后只重读少量已缓存对象的状态
+        private readonly List<Statue> _statueSources = new();
+        private readonly List<Chest> _chestSources = new();
+        private bool _statuesScanned;
+        private bool _chestsScanned;
+        // 城墙建造位：候选列表低频重建，避免每次重刷新都对全部 Payable 做 TryCast + GetComponent
+        private readonly List<PayableUpgrade> _wallSiteSources = new();
+        private bool _wallSitesScanned;
+        private float _nextWallSiteScan;
+        // 城墙/箭塔集合拷贝缓冲（复用，避免每 3 秒分配 IL2CPP 数组）
+        private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall> _wallScanBuffer;
+        private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Tower> _towerScanBuffer;
         private float _nextLightRefresh, _nextMediumRefresh, _nextHeavyRefresh;
-        // 全场景扫描（FindObjectsByType）彼此错峰：集中在一帧执行会形成每 2 秒一次的帧尖峰
-        private float _nextOilScan, _nextCaveScan, _nextFarmScan;
-        // 可选标记分帧轮询：每次重刷新只扫一类（难民营/雕像/坐骑/宝箱/科技），每类约 10 秒刷新一次
-        private int _optionalScanSlot;
+        private float _nextStatDetail;          // 职业细分统计（逐单位扫描）下一次计算时刻
+        // 全场景扫描（FindObjectsByType）彼此错峰：集中在一帧执行会形成帧尖峰
+        private float _nextOilScan, _nextCaveScan, _nextFarmScan, _nextHouseScan;
+        private readonly List<MapMarker> _houseMarkers = new();   // 民房标记（独立列表，避免与难民营互相清空）
+        private bool _enemyScanActive;                           // 上一轮是否在扫怪（用于关闭开关时清空一次）
 
         //   每帧缓存的可见性状态（供 OnGUI 复用，避免每个 GUI 事件重复 IL2CPP 互操作查询）  
         private bool _overlayVisible;
@@ -106,10 +134,18 @@ namespace BetterKingdom
 
         //   面板缓存字符串（仅中频刷新时重建，消除每次 Repaint 的字符串格式化分配）  
         private string _strTime, _strCoins, _strSeason;
+        private string _strHint;   // 屏幕提示文字（仅在进入游戏/修改快捷键后重建一次，其余时间静态复用）
+        private static bool _hintDirty = true;   // 快捷键变化时置脏，下次绘制重建提示文字
+
+        /// <summary>快捷键被修改后调用：提示文字需重新生成（其余时间保持静态，避免每帧拼接字符串）。</summary>
+        internal static void InvalidateHint() => _hintDirty = true;
         private readonly List<string> _jobLines = new();
 
         //   怪物扫描复用缓冲（消除 50Hz 下的数组/字典分配）  
         private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _enemyBuffer;
+        // 中频职业统计复用缓冲（2Hz 刷新时不再每次分配数组）
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer> _archerStatBuffer;
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight> _knightStatBuffer;
         private readonly Dictionary<uint, WaveGroup> _waveGroups = new();   // 按 waveID 分组，跨帧保留同一波的平滑位置
         private readonly List<uint> _staleWaveIds = new();                  // 本帧已消失的波次ID（遍历后再删除）
 
@@ -131,7 +167,6 @@ namespace BetterKingdom
 
         //   游戏时间  
         private float _gameTime = -1f;
-        private Banker _cachedBanker;      // 银行家（税官）缓存（中频重建），国库真实账本 Banker._stashedCoins 所在
 
         //   季节  
         private Season _season;           // 当前季节
@@ -141,7 +176,7 @@ namespace BetterKingdom
         //   职业统计  
         private int _countArchers, _countKnights, _countPikemen, _countFarmers, _countWorkers, _countBerserkers;
         private int _countJobless;
-        // 细分：骑士小队中的弓箭手（isKnightSoldier）、解锁铁科技后用铁剑武装晋升的高级骑士（_wasPromoted）
+        // 细分：骑士小队中的弓箭手（isKnightSoldier）、用铁剑晋升的高级骑士（tag 为 Knight）
         private int _countSquadArchers, _countKnightsAdvanced;
 
         //   金币  
@@ -236,12 +271,13 @@ namespace BetterKingdom
 
             // 全场景扫描彼此错峰，并与功能组件的周期任务共用同一个“本帧唯一重型槽位”：
             // FindObjectsByType 会遍历整个场景，集中执行会形成帧尖峰；抢不到槽位的任务顺延一帧再跑
-            if (now >= _nextCaveScan && FeatureBehaviour.TryReserveHeavySlot())
+            // 洞窟坐标本岛只采集一次：未采到前按快速重试节奏重扫，采到（或重试用尽）后彻底停止
+            if (!_caveScanned && now >= _nextCaveScan && FeatureBehaviour.TryReserveHeavySlot())
             {
-                _nextCaveScan = now + CaveScanInterval;
+                _nextCaveScan = now + CaveScanRetryInterval;
                 RefreshCavePositions();
             }
-            if (now >= _nextOilScan && FeatureBehaviour.TryReserveHeavySlot())
+            if (ModWindowBehaviour.ShowClassStats && now >= _nextOilScan && FeatureBehaviour.TryReserveHeavySlot())
             {
                 _nextOilScan = now + OilScanInterval;
                 RefreshOilBarrels();
@@ -250,6 +286,12 @@ namespace BetterKingdom
             {
                 _nextFarmScan = now + FarmScanInterval;
                 RefreshFarmlandRefs();
+            }
+            // 民房（难民营被毁后重建的形态）需要全场景扫描，单独低频执行，不并入 3 秒重刷新
+            if (now >= _nextHouseScan && FeatureBehaviour.TryReserveHeavySlot())
+            {
+                _nextHouseScan = now + HouseScanInterval;
+                RefreshHouseMarkers();
             }
 
             if (now >= _nextLightRefresh)
@@ -300,7 +342,7 @@ namespace BetterKingdom
             if (Instance != null) Instance._nextHeavyRefresh = 0f;
         }
 
-        /// <summary>轻刷新（50Hz）：只更新需要实时跟随的数据——玩家位置与怪物竖线。</summary>
+        /// <summary>轻刷新（20Hz）：只更新需要实时跟随的数据——玩家位置与怪物竖线。</summary>
         private void RefreshLightData()
         {
             try
@@ -322,8 +364,18 @@ namespace BetterKingdom
                 }
                 catch { }
 
-                // 怪物波次竖线位置（实时刷新）
-                RefreshEnemyLines(managers, kingdom);
+                // 怪物竖线与怪物血条：两个开关都关闭时完全不必遍历敌人（关闭瞬间清空一次残留）
+                if (ModWindowBehaviour.ShowMapEnemies || ModWindowBehaviour.ShowGreedHealth)
+                {
+                    _enemyScanActive = true;
+                    RefreshEnemyLines(managers, kingdom);
+                }
+                else if (_enemyScanActive)
+                {
+                    _enemyScanActive = false;
+                    _enemyLineX.Clear();
+                    _hpBars.Clear();
+                }
 
                 // 作物生长进度（引用中频缓存，这里只读进度值）
                 RefreshCropBars();
@@ -332,9 +384,9 @@ namespace BetterKingdom
         }
 
         /// <summary>
-        /// 中频刷新（4Hz）：时间/季节/金币/职业统计等数值信息。
-        /// 这些数值变化慢，4Hz 更新肉眼无感知，集中在此避免 50Hz 的 IL2CPP 互操作开销。
-        /// 显示字符串也在此重建，OnGUI 每次 Repaint 只做纯绘制。
+        /// 中频刷新（2Hz）：时间/季节/金币/职业统计等数值信息。
+        /// 这些数值变化慢，2Hz 更新肉眼无感知，集中在此避免高频的 IL2CPP 互操作开销
+        /// （职业统计每次都要对全部弓箭手/骑士做一次数组拷贝并逐单位取值）。
         /// </summary>
         private void RefreshMediumData()
         {
@@ -402,28 +454,9 @@ namespace BetterKingdom
 
                     // 路径2：Banker._stashedCoins（Banker 藏匿的金币）
                     int bankerCoins = 0;
-                    // 缓存优先复用：FindObjectsByType(含隐藏对象) 是全场景遍历，每 0.25s 执行会造成周期性卡顿，
-                    // 只有缓存失效（税官被销毁）或从未找到时才重新查找
-                    Banker banker = _cachedBanker;
-                    if (banker != null)
-                    {
-                        try { if (banker.gameObject == null) banker = null; } catch { banker = null; }
-                    }
-                    if (banker == null)
-                    {
-                        banker = kingdom.banker;
-                        // kingdom.banker 常为空（税官藏在城堡里时引用不维护），用场景查找兜底（含隐藏对象）
-                        if (banker == null)
-                        {
-                            try
-                            {
-                                var bankers = UnityEngine.Object.FindObjectsByType<Banker>(FindObjectsInactive.Include, FindObjectsSortMode.None);
-                                if (bankers.Length > 0) banker = bankers[0];
-                            }
-                            catch { }
-                        }
-                        _cachedBanker = banker;
-                    }
+                    // 税官解析与限频由 FeatureBehaviour 统一负责（场景查找是全场景遍历，
+                    // 两边各每 0.25s 扫一次会造成周期性卡顿）
+                    Banker banker = FeatureBehaviour.ResolveBanker(kingdom);
                     if (banker != null)
                     {
                         try { bankerCoins = banker._stashedCoins; } catch { }
@@ -457,45 +490,57 @@ namespace BetterKingdom
                 }
                 catch { }
 
-                // 细分：骑士小队中的弓箭手（isKnightSoldier=true 表示已被骑士征入小队）
-                _countSquadArchers = 0;
-                try
-                {
-                    Il2CppSystem.Collections.Generic.ICollection<Archer> archers = kingdom.Archers;
-                    if (archers != null && archers.Count > 0)
-                    {
-                        int n = archers.Count;
-                        var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(n);
-                        archers.CopyTo(arr, 0);
-                        for (int i = 0; i < n; i++)
-                        {
-                            Archer a = arr[i];
-                            if (a == null) continue;
-                            try { if (a.isKnightSoldier) _countSquadArchers++; } catch { }
-                        }
-                    }
-                }
-                catch { }
+                // 细分统计：职业面板未开启时不必逐单位读取；开启时也降到 2 秒一次（数值变化慢）
+                float detailNow = Time.unscaledTime;
+                bool wantDetail = ModWindowBehaviour.ShowClassStats && detailNow >= _nextStatDetail;
+                if (wantDetail) _nextStatDetail = detailNow + 2f;
 
-                // 细分：高级骑士（_wasPromoted：解锁铁科技后被铁剑武装晋升的骑士；rank 字段恒为正，不能用于区分）
-                _countKnightsAdvanced = 0;
-                try
+                // 细分：骑士小队中的弓箭手（isKnightSoldier=true 表示已被骑士征入小队）
+                // 细分：高级骑士（用铁剑晋升、tag 为 Knight 的骑士；_wasPromoted 只标记被回收的旧侍从，不能用于区分）
+                if (wantDetail)
                 {
-                    Il2CppSystem.Collections.Generic.ICollection<Knight> knights = kingdom.Knights;
-                    if (knights != null && knights.Count > 0)
+                    _countSquadArchers = 0;
+                    try
                     {
-                        int n = knights.Count;
-                        var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight>(n);
-                        knights.CopyTo(arr, 0);
-                        for (int i = 0; i < n; i++)
+                        Il2CppSystem.Collections.Generic.ICollection<Archer> archers = kingdom.Archers;
+                        if (archers != null && archers.Count > 0)
                         {
-                            Knight k = arr[i];
-                            if (k == null) continue;
-                            try { if (k._wasPromoted) _countKnightsAdvanced++; } catch { }
+                            int n = archers.Count;
+                            if (_archerStatBuffer == null || _archerStatBuffer.Length < n)
+                                _archerStatBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(Math.Max(n, 16));
+                            var arr = _archerStatBuffer;
+                            archers.CopyTo(arr, 0);
+                            for (int i = 0; i < n; i++)
+                            {
+                                Archer a = arr[i];
+                                if (a == null) continue;
+                                try { if (a.isKnightSoldier) _countSquadArchers++; } catch { }
+                            }
                         }
                     }
+                    catch { }
+
+                    _countKnightsAdvanced = 0;
+                    try
+                    {
+                        Il2CppSystem.Collections.Generic.ICollection<Knight> knights = kingdom.Knights;
+                        if (knights != null && knights.Count > 0)
+                        {
+                            int n = knights.Count;
+                            if (_knightStatBuffer == null || _knightStatBuffer.Length < n)
+                                _knightStatBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight>(Math.Max(n, 16));
+                            var arr = _knightStatBuffer;
+                            knights.CopyTo(arr, 0);
+                            for (int i = 0; i < n; i++)
+                            {
+                                Knight k = arr[i];
+                                if (k == null) continue;
+                                try { if (FeatureBehaviour.IsAdvancedKnight(k)) _countKnightsAdvanced++; } catch { }
+                            }
+                        }
+                    }
+                    catch { }
                 }
-                catch { }
 
                 RebuildDisplayStrings();
             }
@@ -671,8 +716,8 @@ namespace BetterKingdom
                 Kingdom kingdom = managers.kingdom;
                 if (kingdom == null) { _hasData = false; return; }
 
-                // 城堡位置（基本静态，重刷新时更新即可）
-                _hasCastle = TryGetX(kingdom.castle, out _castleX);
+                // 城堡位置：本岛第一次读到后即记住，之后不再刷新（换岛时由 ResetIslandCaches 清空重读）
+                if (!_hasCastle) _hasCastle = TryGetX(kingdom.castle, out _castleX);
 
                 // 火油桶统计已独立成 4 秒定时任务（见 Update 的 OilScanInterval），不再放进重刷新
 
@@ -699,6 +744,18 @@ namespace BetterKingdom
                         _boundLeft = boundLeft;
                         _boundRight = boundRight;
                         _caveTrimmed = false;
+                        // 换岛/换关卡：城堡、洞窟、坐骑、科技点等“本岛只采集一次”的数据全部作废，下轮重新采集
+                        ResetIslandCaches();
+                        // 已访问过本岛则直接复用上次的裁剪结果：洞窟被炸毁后重进该岛时，
+                        // 不会再因为找不到洞窟坐标而把悬崖侧空白画出来
+                        if (_islandTrimCache.TryGetValue(IslandBoundsKey(boundLeft, boundRight), out Vector2 cachedTrim) &&
+                            cachedTrim.x < cachedTrim.y)
+                        {
+                            _boundLeft = cachedTrim.x;
+                            _boundRight = cachedTrim.y;
+                            _caveTrimmed = true;
+                            _caveScanned = true;   // 已复用裁剪结果，本岛无需再扫描洞窟
+                        }
                     }
                     _boundsReady = true;
                 }
@@ -732,7 +789,7 @@ namespace BetterKingdom
                 }
                 catch { }
 
-                // 洞窟坐标由 RefreshCavePositions 单独扫描（10 秒一次），这里只复用缓存：
+                // 洞窟坐标由 RefreshCavePositions 在本岛首次上岛时扫描一次，这里只复用缓存：
                 // 过滤与洞窟重合的怪物传送门；边界不可用时把洞窟坐标纳入地图范围
                 try
                 {
@@ -765,6 +822,12 @@ namespace BetterKingdom
                         _boundLeft = _rawBoundLeft;
                         _boundRight = _rawBoundRight;
                     }
+                    else
+                    {
+                        // 记住本岛的裁剪结果（按地面原始边界标识），重进该岛时直接复用
+                        _islandTrimCache[IslandBoundsKey(_rawBoundLeft, _rawBoundRight)] =
+                            new Vector2(_boundLeft, _boundRight);
+                    }
                     _caveTrimmed = true;
                 }
 
@@ -779,6 +842,7 @@ namespace BetterKingdom
 
                 // 功能开关控制的额外标记：分帧轮询，每次重刷新只扫一类（开关关闭时立即清空）
                 ScanOptionalMarkers(kingdom);
+                RefreshTechMarkerStates();   // 科技点已采集过一次，只做“已解锁则移除”的轻量检查
                 if (ModWindowBehaviour.ShowTeleporters) CollectTeleporters(world);
 
                 _hasData = minX < maxX;
@@ -789,6 +853,60 @@ namespace BetterKingdom
                 _maxX = maxX + pad;
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 换岛/换关卡时清空“本岛只采集一次”的缓存：城堡位置、洞窟坐标、坐骑出生点、科技点，
+        /// 以及各类可选标记（避免新岛上短暂显示上一岛的标记）。
+        /// </summary>
+        private void ResetIslandCaches()
+        {
+            _hasCastle = false;
+            // 洞窟：旧坐标必须立即丢弃，等本岛首次扫描重新采集
+            _caveScanned = false;
+            _caveX.Clear();
+            _caveRetryScans = 0;
+            _nextCaveScan = Time.unscaledTime;
+            // 坐骑/科技：本岛重新采集一次
+            _mountsScanned = false;
+            _mountMarkers.Clear();
+            _techScanned = false;
+            _techMarkers.Clear();
+            _techSources.Clear();
+            // 雕像/宝箱/城墙建造位：本岛重新采集一次
+            _statuesScanned = false;
+            _statueSources.Clear();
+            _chestsScanned = false;
+            _chestSources.Clear();
+            _wallSitesScanned = false;
+            _wallSiteSources.Clear();
+            _nextWallSiteScan = 0f;
+            // 其余周期扫描的可选标记也清掉，避免显示上一岛的坐标
+            _campMarkers.Clear();
+            _houseMarkers.Clear();
+            _statueMarkers.Clear();
+            _chestMarkers.Clear();
+        }
+
+        /// <summary>
+        /// 科技点只在本岛采集一次；已解锁（原始对象销毁或名称不再含 undeveloped）时移除对应标记。
+        /// 只检查已记录的少量对象，不再全场景扫描。
+        /// </summary>
+        private void RefreshTechMarkerStates()
+        {
+            for (int i = _techSources.Count - 1; i >= 0; i--)
+            {
+                bool keep = false;
+                try
+                {
+                    Payable p = _techSources[i];
+                    keep = p != null && p.gameObject != null && p.gameObject.name.Contains("undeveloped");
+                }
+                catch { keep = false; }
+                if (keep) continue;
+                _techSources.RemoveAt(i);
+                if (i < _techMarkers.Count) _techMarkers.RemoveAt(i);
+            }
         }
 
         /// <summary>
@@ -843,9 +961,13 @@ namespace BetterKingdom
             return false;
         }
 
+        /// <summary>关卡标识：地面原始边界（取整到 0.01），用作每岛裁剪结果的缓存键。</summary>
+        private static (long, long) IslandBoundsKey(float left, float right)
+            => ((long)Mathf.Round(left * 100f), (long)Mathf.Round(right * 100f));
+
         /// <summary>
-        /// 刷新洞窟坐标（10 秒一次）：洞窟是静态关卡对象，只有被炸毁时集合才变化，
-        /// 没必要塞进 2 秒重刷新里做一次全场景扫描。已裁剪的地图边界不会因洞窟消失而回弹。
+        /// 采集本岛洞窟坐标：只在首次上岛时扫描（洞窟对象可能晚于地面边界创建，因此未采到前 2.5 秒快速重试），
+        /// 采到或重试用尽后本岛不再扫描。已裁剪的地图边界不会因洞窟消失而回弹。
         /// </summary>
         private void RefreshCavePositions()
         {
@@ -859,52 +981,99 @@ namespace BetterKingdom
                 }
             }
             catch { }
+            if (_caveX.Count > 0)
+            {
+                _caveRetryScans = 0;
+                _caveScanned = true;   // 本岛已采到洞窟，之后不再扫描
+                // 首次拿到本关卡洞窟坐标：让重刷新尽快按洞窟裁剪边界，
+                // 否则要等下一次重刷新，这段时间地图仍会把洞窟侧的空白区域画出来
+                if (!_caveTrimmed && _boundsReady) _nextHeavyRefresh = 0f;
+            }
+            else if (_boundsReady && !_caveTrimmed && _caveRetryScans < CaveScanMaxRetries)
+            {
+                _caveRetryScans++;
+            }
+            else
+            {
+                _caveScanned = true;   // 重试用尽仍未采到（或已用缓存裁剪）：本岛不再扫描
+            }
         }
 
         /// <summary>
-        /// 可选标记分帧轮询：难民营/雕像/坐骑/宝箱/科技解锁点各自需要一次全场景扫描，
-        /// 集中在一帧执行会形成明显卡顿；这里每次重刷新只处理一类（每类约 10 秒刷新一次）。
-        /// 关闭对应开关时立即清空，不受轮询节奏影响。
+        /// 可选标记更新：难民营来自游戏维护的集合（非全场景扫描），每轮重刷新直接读取；
+        /// 雕像/宝箱/坐骑/科技点为静态关卡对象，本岛只做一次全场景扫描，之后仅重读少量已缓存对象的状态；
+        /// 民房（重建难民营）由 RefreshHouseMarkers 以低频独立扫描（见 Update）。
         /// </summary>
         private void ScanOptionalMarkers(Kingdom kingdom)
         {
-            if (!ModWindowBehaviour.ShowAllCamps) _campMarkers.Clear();
-            if (!ModWindowBehaviour.ShowStatues) _statueMarkers.Clear();
-            if (!ModWindowBehaviour.ShowMountSpawns) _mountMarkers.Clear();
-            if (!ModWindowBehaviour.ShowChests) _chestMarkers.Clear();
-            if (!ModWindowBehaviour.ShowTechPoints) _techMarkers.Clear();
+            if (!ModWindowBehaviour.ShowAllCamps)
+            {
+                _campMarkers.Clear();
+                _houseMarkers.Clear();
+            }
+            if (!ModWindowBehaviour.ShowStatues)
+            {
+                _statueMarkers.Clear();
+                _statueSources.Clear();
+                _statuesScanned = false;   // 关掉开关后清空，再次打开时重新采集一次
+            }
+            if (!ModWindowBehaviour.ShowChests)
+            {
+                _chestMarkers.Clear();
+                _chestSources.Clear();
+                _chestsScanned = false;    // 同上
+            }
+            if (!ModWindowBehaviour.ShowMountSpawns)
+            {
+                _mountMarkers.Clear();
+                _mountsScanned = false;   // 关掉开关后清空，再次打开时重新采集一次
+            }
+            if (!ModWindowBehaviour.ShowTechPoints)
+            {
+                _techMarkers.Clear();
+                _techSources.Clear();
+                _techScanned = false;     // 同上：再次打开时重新采集一次
+            }
 
-            _optionalScanSlot++;
-            if (_optionalScanSlot >= 5) _optionalScanSlot = 0;
             try
             {
-                switch (_optionalScanSlot)
+                if (ModWindowBehaviour.ShowAllCamps) CollectCampMarkers(kingdom);
+
+                if (ModWindowBehaviour.ShowStatues)
                 {
-                    case 0:
-                        if (!ModWindowBehaviour.ShowAllCamps) break;
-                        _campMarkers.Clear();
-                        CollectCampMarkers(kingdom);
-                        break;
-                    case 1:
-                        if (!ModWindowBehaviour.ShowStatues) break;
-                        _statueMarkers.Clear();
+                    if (!_statuesScanned)
+                    {
                         CollectStatueMarkers();
-                        break;
-                    case 2:
-                        if (!ModWindowBehaviour.ShowMountSpawns) break;
-                        _mountMarkers.Clear();
-                        CollectMountMarkers();
-                        break;
-                    case 3:
-                        if (!ModWindowBehaviour.ShowChests) break;
-                        _chestMarkers.Clear();
+                        _statuesScanned = true;
+                    }
+                    else RefreshStatueMarkerStates();
+                }
+
+                if (ModWindowBehaviour.ShowChests)
+                {
+                    if (!_chestsScanned)
+                    {
                         CollectChestMarkers();
-                        break;
-                    default:
-                        if (!ModWindowBehaviour.ShowTechPoints) break;
-                        _techMarkers.Clear();
-                        CollectTechMarkers();
-                        break;
+                        _chestsScanned = true;
+                    }
+                    else RefreshChestMarkerStates();
+                }
+
+                // 坐骑出生点是静态关卡对象：本岛采集一次后不再扫描
+                if (ModWindowBehaviour.ShowMountSpawns && !_mountsScanned)
+                {
+                    _mountMarkers.Clear();
+                    CollectMountMarkers();
+                    _mountsScanned = true;
+                }
+
+                // 科技点：本岛采集一次；解锁后由 RefreshTechMarkerStates 移除标记，不再全场景重扫
+                if (ModWindowBehaviour.ShowTechPoints && !_techScanned)
+                {
+                    _techMarkers.Clear();
+                    _techSources.Clear();
+                    CollectTechMarkers();
+                    _techScanned = true;
                 }
             }
             catch { }
@@ -959,17 +1128,28 @@ namespace BetterKingdom
             catch { return false; }
         }
 
-        /// <summary>农田引用缓存重建（中频）：仅在开关开启时扫描，失败置空避免误用失效引用。</summary>
+        /// <summary>
+        /// 农田引用与位置缓存重建（低频）：仅在开关开启时扫描；位置在扫描时读一次并缓存，
+        /// 轻刷新不再反复读取 transform（每次读取都会生成包装对象，是 20Hz 下的主要分配来源）。
+        /// </summary>
         private void RefreshFarmlandRefs()
         {
             _farmlands.Clear();
+            _farmlandPos.Clear();
             if (!ModWindowBehaviour.ShowCropProgress) return;
             try
             {
                 var lands = UnityEngine.Object.FindObjectsByType<Farmland>(FindObjectsSortMode.None);
                 if (lands == null) return;
                 for (int i = 0; i < lands.Length; i++)
-                    if (lands[i] != null) _farmlands.Add(lands[i]);
+                {
+                    Farmland f = lands[i];
+                    if (f == null) continue;
+                    Vector3 pos;
+                    try { pos = f.transform.position; } catch { continue; }
+                    _farmlands.Add(f);
+                    _farmlandPos.Add(pos);
+                }
             }
             catch { }
         }
@@ -1041,7 +1221,7 @@ namespace BetterKingdom
                 Farmland f = _farmlands[i];
                 try
                 {
-                    if (f == null) { _farmlands.RemoveAt(i); continue; }
+                    if (f == null) { RemoveFarmlandAt(i); continue; }
 
                     int farmPoints = 0, cur = 0;
                     bool isFarmed = false;
@@ -1056,10 +1236,18 @@ namespace BetterKingdom
                     if (cur <= 0 && !isFarmed) continue;
 
                     // 阶梯更新：按游戏的真实进度点（整数）直接显示，不做平滑插值
-                    _cropBars.Add(new WorldBar { Pos = f.transform.position + new Vector3(0f, CropBarWorldOffsetY, 0f), Frac = Mathf.Clamp01(frac) });
+                    Vector3 pos = i < _farmlandPos.Count ? _farmlandPos[i] : f.transform.position;
+                    _cropBars.Add(new WorldBar { Pos = pos + new Vector3(0f, CropBarWorldOffsetY, 0f), Frac = Mathf.Clamp01(frac) });
                 }
-                catch { _farmlands.RemoveAt(i); }
+                catch { RemoveFarmlandAt(i); }
             }
+        }
+
+        /// <summary>同时移除农田引用与坐标缓存，保持两个列表下标一致。</summary>
+        private void RemoveFarmlandAt(int index)
+        {
+            _farmlands.RemoveAt(index);
+            if (index < _farmlandPos.Count) _farmlandPos.RemoveAt(index);
         }
 
         /// <summary>
@@ -1072,6 +1260,8 @@ namespace BetterKingdom
         {
             _wallMarkers.Clear();
             _towerMarkers.Clear();
+            // 城墙/箭塔绘制本来就受该开关控制，关闭时无需采集（省掉每 3 秒的整轮遍历）
+            if (!ModWindowBehaviour.ShowAllDefenses) return;
 
             // 真墙（含施工中状态）
             try
@@ -1080,11 +1270,12 @@ namespace BetterKingdom
                 if (walls != null && walls.Count > 0)
                 {
                     int count = walls.Count;
-                    var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall>(count);
-                    walls.CopyTo(arr, 0);
+                    if (_wallScanBuffer == null || _wallScanBuffer.Length < count)
+                        _wallScanBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall>(count);
+                    walls.CopyTo(_wallScanBuffer, 0);
                     for (int i = 0; i < count; i++)
                     {
-                        Wall w = arr[i];
+                        Wall w = _wallScanBuffer[i];
                         if (!TryGetX(w, out float x)) continue;
                         string label = "城墙";
                         try
@@ -1109,11 +1300,12 @@ namespace BetterKingdom
                 if (towers != null && towers.Count > 0)
                 {
                     int count = towers.Count;
-                    var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Tower>(count);
-                    towers.CopyTo(arr, 0);
+                    if (_towerScanBuffer == null || _towerScanBuffer.Length < count)
+                        _towerScanBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Tower>(count);
+                    towers.CopyTo(_towerScanBuffer, 0);
                     for (int i = 0; i < count; i++)
                     {
-                        Tower t = arr[i];
+                        Tower t = _towerScanBuffer[i];
                         if (!TryGetX(t, out float x)) continue;
                         string label = "箭塔";
                         try
@@ -1137,7 +1329,31 @@ namespace BetterKingdom
             }
             catch { }
 
-            // 城墙建造位：PayableManager 中可升级为 Wall 的支付点（与已有真墙去重）
+            // 城墙建造位：候选列表由 RefreshWallSiteSources 低频重建，这里只读缓存坐标（与已有真墙去重）
+            if (!_wallSitesScanned || Time.unscaledTime >= _nextWallSiteScan) RefreshWallSiteSources();
+            for (int i = _wallSiteSources.Count - 1; i >= 0; i--)
+            {
+                PayableUpgrade upgrade = _wallSiteSources[i];
+                if (upgrade == null) { _wallSiteSources.RemoveAt(i); continue; }
+                try
+                {
+                    if (!TryGetX(upgrade, out float x) || _wallX.Contains(x)) continue;
+                    _wallMarkers.Add(new MapMarker { X = x, Label = "城墙建造位" });
+                    _wallX.Add(x);
+                    if (!boundsValid) { minX = Math.Min(minX, x); maxX = Math.Max(maxX, x); }
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// 重建城墙建造位候选列表：一次性遍历 PayableManager.AllPayables，筛出 nextPrefab 含 Wall 的 PayableUpgrade。
+        /// 该开销（TryCast + GetComponent）较大，因此改为低频重建（WallSiteRescanInterval）并缓存对象引用，
+        /// 不再放进每 3 秒的重刷新里。
+        /// </summary>
+        private void RefreshWallSiteSources()
+        {
+            _wallSiteSources.Clear();
             try
             {
                 Managers managers = SingletonMonoBehaviour<Managers>.Inst;
@@ -1151,16 +1367,13 @@ namespace BetterKingdom
                         if (upgrade == null) continue;
                         GameObject next = upgrade.nextPrefab;
                         if (next == null || next.GetComponent<Wall>() == null) continue;
-                        if (TryGetX(upgrade, out float x) && !_wallX.Contains(x))
-                        {
-                            _wallMarkers.Add(new MapMarker { X = x, Label = "城墙建造位" });
-                            _wallX.Add(x);
-                            if (!boundsValid) { minX = Math.Min(minX, x); maxX = Math.Max(maxX, x); }
-                        }
+                        _wallSiteSources.Add(upgrade);
                     }
                 }
             }
             catch { }
+            _wallSitesScanned = true;
+            _nextWallSiteScan = Time.unscaledTime + WallSiteRescanInterval;
         }
 
         private const int WoodMaxLevel = 2;   // 木制共 2 级
@@ -1221,11 +1434,12 @@ namespace BetterKingdom
         }
 
         /// <summary>
-        /// 收集所有难民营与民房标记：Kingdom.BeggarCamps 由游戏维护（难民营被摧毁时从集合移除），
-        /// 摧毁后重建的为 CitizenHousePayable（民房）——不在 BeggarCamps 中，需单独收集，颜色与难民营一致。
+        /// 收集所有难民营标记：Kingdom.BeggarCamps 由游戏维护（难民营被摧毁时从集合移除）。
+        /// 摧毁后重建的民房（CitizenHousePayable）不在该集合中，由 RefreshHouseMarkers 低频扫描。
         /// </summary>
         private void CollectCampMarkers(Kingdom kingdom)
         {
+            _campMarkers.Clear();
             try
             {
                 Il2CppSystem.Collections.Generic.HashSet<BeggarCamp> camps = kingdom.BeggarCamps;
@@ -1242,41 +1456,61 @@ namespace BetterKingdom
                 }
             }
             catch { }
+        }
 
-            // 民房（被摧毁难民营的重建形态），颜色不改，名称"民房"
+        /// <summary>
+        /// 民房（被摧毁难民营的重建形态）：需要全场景扫描，因此独立低频执行（HouseScanInterval），
+        /// 不再塞进 3 秒重刷新链，避免周期性帧尖峰。
+        /// </summary>
+        private void RefreshHouseMarkers()
+        {
+            _houseMarkers.Clear();
+            if (!ModWindowBehaviour.ShowAllCamps) return;
             try
             {
                 var houses = UnityEngine.Object.FindObjectsByType<CitizenHousePayable>(FindObjectsSortMode.None);
                 foreach (CitizenHousePayable h in houses)
                 {
                     if (h == null || !TryGetX(h, out float x)) continue;
-                    _campMarkers.Add(new MapMarker { X = x, Label = "民房" });
+                    _houseMarkers.Add(new MapMarker { X = x, Label = "民房" });
                 }
             }
             catch { }
         }
 
-        /// <summary>收集所有雕像标记，标签为雕像名称+激活状态（如"弓箭手雕像（已激活）"）。</summary>
+        /// <summary>收集所有雕像标记（本岛一次）：只记录对象引用，标签由 RefreshStatueMarkerStates 重读状态生成。</summary>
         private void CollectStatueMarkers()
         {
+            _statueSources.Clear();
             try
             {
                 var statues = UnityEngine.Object.FindObjectsByType<Statue>(FindObjectsSortMode.None);
                 foreach (Statue s in statues)
-                {
-                    if (s == null || !TryGetX(s, out float x)) continue;
-                    string label = "雕像";
-                    try
-                    {
-                        label = DeityName(s.deity);
-                        // deityStatus：GemLocked/CoinLocked=未激活，Activated=已激活
-                        label += s.deityStatus == Statue.DeityStatus.Activated ? "（已激活）" : "（未激活）";
-                    }
-                    catch { }
-                    _statueMarkers.Add(new MapMarker { X = x, Label = label });
-                }
+                    if (s != null) _statueSources.Add(s);
             }
             catch { }
+            RefreshStatueMarkerStates();
+        }
+
+        /// <summary>重读已缓存雕像的激活状态，生成标签（雕像数量很少，开销可忽略）。</summary>
+        private void RefreshStatueMarkerStates()
+        {
+            _statueMarkers.Clear();
+            for (int i = _statueSources.Count - 1; i >= 0; i--)
+            {
+                Statue s = _statueSources[i];
+                if (s == null) { _statueSources.RemoveAt(i); continue; }
+                if (!TryGetX(s, out float x)) continue;
+                string label = "雕像";
+                try
+                {
+                    label = DeityName(s.deity);
+                    // deityStatus：GemLocked/CoinLocked=未激活，Activated=已激活
+                    label += s.deityStatus == Statue.DeityStatus.Activated ? "（已激活）" : "（未激活）";
+                }
+                catch { }
+                _statueMarkers.Add(new MapMarker { X = x, Label = label });
+            }
         }
 
         /// <summary>雕像 deity 枚举 → 中文名称。</summary>
@@ -1317,28 +1551,42 @@ namespace BetterKingdom
             catch { }
         }
 
-        /// <summary>收集所有未开启的宝箱标记：currencyType 区分金币宝箱/宝石宝箱，已开启(_wasTriggered)的不显示。</summary>
+        /// <summary>收集所有宝箱（本岛一次）：只记录对象引用，标签与开启状态由 RefreshChestMarkerStates 重读。</summary>
         private void CollectChestMarkers()
         {
+            _chestSources.Clear();
             try
             {
                 var chests = UnityEngine.Object.FindObjectsByType<Chest>(FindObjectsSortMode.None);
                 foreach (Chest c in chests)
-                {
-                    if (c == null || !TryGetX(c, out float x)) continue;
-                    bool opened = false;
-                    string label = "金币宝箱";
-                    try
-                    {
-                        opened = c._wasTriggered;          // 已触发开启的宝箱跳过
-                        if (c.currencyType == CurrencyType.Gems) label = "宝石宝箱";
-                    }
-                    catch { }
-                    if (opened) continue;
-                    _chestMarkers.Add(new MapMarker { X = x, Label = label });
-                }
+                    if (c != null) _chestSources.Add(c);
             }
             catch { }
+            RefreshChestMarkerStates();
+        }
+
+        /// <summary>
+        /// 重读已缓存宝箱的状态并生成标记：currencyType 区分金币宝箱/宝石宝箱，已开启(_wasTriggered)的不显示。
+        /// </summary>
+        private void RefreshChestMarkerStates()
+        {
+            _chestMarkers.Clear();
+            for (int i = _chestSources.Count - 1; i >= 0; i--)
+            {
+                Chest c = _chestSources[i];
+                if (c == null) { _chestSources.RemoveAt(i); continue; }
+                if (!TryGetX(c, out float x)) continue;
+                bool opened = false;
+                string label = "金币宝箱";
+                try
+                {
+                    opened = c._wasTriggered;          // 已触发开启的宝箱跳过
+                    if (c.currencyType == CurrencyType.Gems) label = "宝石宝箱";
+                }
+                catch { }
+                if (opened) continue;
+                _chestMarkers.Add(new MapMarker { X = x, Label = label });
+            }
         }
 
         /// <summary>
@@ -1368,6 +1616,7 @@ namespace BetterKingdom
                     else if (name.Contains("Iron") || name.Contains("Mine")) label = "铁器科技";
                     else continue;
                     _techMarkers.Add(new MapMarker { X = x, Label = label });
+                    _techSources.Add(p);   // 记录原始对象，解锁后据此移除标记（不做全场景重扫）
                 }
             }
             catch { }
@@ -1564,6 +1813,8 @@ namespace BetterKingdom
         {
             // 使用 Update 中缓存的可见性状态，避免每个 GUI 事件都做 IL2CPP 互操作查询
             if (!_hasData || !_overlayVisible) return;
+            // IMGUI 布局/输入事件阶段不需要绘制：只处理 Repaint，直接省掉一半以上的 OnGUI 执行与临时分配
+            if (Event.current.type != EventType.Repaint) return;
 
             bool isMenuOpen = _isMenuOpen;
             GUI.depth = 100;
@@ -1580,8 +1831,14 @@ namespace BetterKingdom
                 if (!isMenuOpen && !ModWindowBehaviour.IsOpen)
                 {
                     const float hintW = 400f;
+                    // 提示文字只在进入游戏/修改快捷键后重建一次，其余时间直接复用静态字符串
+                    if (_hintDirty || _strHint == null)
+                    {
+                        _strHint = "按 " + ModWindowBehaviour.OpenKeyDisplay + " 进入BetterKingdom MOD设置菜单";
+                        _hintDirty = false;
+                    }
                     GUI.Label(new Rect(screenW * 0.5f - hintW * 0.5f, frameH + 4f, hintW, LabelFontSize + 6f),
-                        "按 " + ModWindowBehaviour.OpenKeyDisplay + " 进入BetterKingdom MOD设置菜单", _styleLabel);
+                        _strHint, _styleLabel);
                 }
 
                 GUI.Box(new Rect(LeftMargin, centerY - LineThickness * 0.5f,
@@ -1624,6 +1881,8 @@ namespace BetterKingdom
                 }
                 // 功能开关控制的额外标记（对应列表仅开关开启时才有数据）
                 foreach (MapMarker m in _campMarkers)
+                    DrawDotWithLabel(m.X, centerY, DotRadius - 1f, _styleCamp, m.Label);
+                foreach (MapMarker m in _houseMarkers)
                     DrawDotWithLabel(m.X, centerY, DotRadius - 1f, _styleCamp, m.Label);
                 foreach (MapMarker m in _statueMarkers)
                     DrawDotWithLabel(m.X, centerY, DotRadius - 1f, _styleStatue, m.Label);

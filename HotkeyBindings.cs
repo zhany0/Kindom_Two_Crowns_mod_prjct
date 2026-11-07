@@ -18,6 +18,12 @@ namespace BetterKingdom
         private static KeyCode _openKey1 = KeyCode.F3;    // 解析后的主键
         private static KeyCode _openKey2 = KeyCode.F4;    // 解析后的组合键（None=单键）
 
+        // 支付键解析缓存：IsPayKeyHeld 每帧被调用，若每次都 Split/Trim 配置字符串会持续产生垃圾，
+        // 累积到一定程度就触发一次 GC，表现为与刷新间隔无关的周期性卡顿
+        private static string _payRawP1, _payRawP2;
+        private static KeyCode _payMainP1, _payMainP2;
+        private static Rewired.ModifierKey _payModP1, _payModP2;
+
         /// <summary>游戏按键绑定定义（Rewired 运行时改绑 + BepInEx 配置持久化）。</summary>
         public sealed class Binding
         {
@@ -212,6 +218,7 @@ namespace BetterKingdom
             {
                 _cfgOpenWindowKey.Value = s;   // ConfigEntry 赋值自动写盘
                 ParseOpenKey(s);
+                MapOverlayBehaviour.InvalidateHint();   // 屏幕提示文字只在改键后重建一次
             }
             return s;
         }
@@ -228,6 +235,7 @@ namespace BetterKingdom
         {
             if (_cfgOpenWindowKey != null) _cfgOpenWindowKey.Value = DefaultOpenWindowKey;   // ConfigEntry 赋值自动写盘
             ParseOpenKey(DefaultOpenWindowKey);
+            MapOverlayBehaviour.InvalidateHint();   // 恢复默认后同步刷新屏幕提示文字
             foreach (var b in _gameBindings)
             {
                 if (b.Entry == null) continue;
@@ -380,7 +388,21 @@ namespace BetterKingdom
             foreach (var b in _gameBindings)
             {
                 if (b.Id != id || b.Entry == null) continue;
-                ParseGameKey(b.Entry.Value, out KeyCode main, out Rewired.ModifierKey mod);
+                string raw = b.Entry.Value;
+                KeyCode main;
+                Rewired.ModifierKey mod;
+                if (playerIndex == 1)
+                {
+                    if (raw != _payRawP2) { ParseGameKey(raw, out _payMainP2, out _payModP2); _payRawP2 = raw; }
+                    main = _payMainP2;
+                    mod = _payModP2;
+                }
+                else
+                {
+                    if (raw != _payRawP1) { ParseGameKey(raw, out _payMainP1, out _payModP1); _payRawP1 = raw; }
+                    main = _payMainP1;
+                    mod = _payModP1;
+                }
                 if (main == KeyCode.None || !Input.GetKey(main)) return false;
                 switch (mod)
                 {

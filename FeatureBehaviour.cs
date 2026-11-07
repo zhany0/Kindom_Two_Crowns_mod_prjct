@@ -15,12 +15,22 @@ namespace BetterKingdom
         // 注：构建链为 .NET SDK 6（最高 C# 10），请勿使用主构造函数/集合表达式等 C# 12 语法
         public FeatureBehaviour(IntPtr ptr) : base(ptr) { }
 
-        private const float CacheInterval = 0.25f;   // 玩家/城堡/国库缓存刷新间隔
-        private const float HeavyInterval = 2f;      // 墙体修正间隔
-        private const float WallQueueClampInterval = 0.25f;  // 禁用排队时复钳间隔（游戏可能在分配补丁之外重写排队值）
-        private const float AssaultCheckInterval = 0.2f;    // 墙外进攻怪物检测间隔
+        // ---- 周期刷新总体节奏 ----
+        // 设计原则：安全相关（怪物检测）保持较高频率；纯显示/纠正类任务降频；
+        // 所有重型任务共用 TryReserveHeavySlot 的本帧唯一槽位，且相邻两个重型任务之间至少空一帧，
+        // 把全场景扫描/大集合遍历摊平到多帧，避免同一帧叠多个重活造成偶发卡顿。
+        private const float CacheInterval = 0.5f;            // 玩家/城堡/税官缓存刷新间隔（数值变化慢，2Hz 足够）
+        private const float HeavyInterval = 3f;              // 墙体/守卫槽修正间隔（纠错类，不需要 2 秒一次）
+        private const float WallBoundsScanInterval = 5f;     // 墙体边界重建间隔（墙只在建造/被毁时变化）
+        private const float WallQueueClampInterval = 1f;     // 禁用排队时复钳间隔（分配补丁已即时复钳，这里只做兜底）
+        private const float AssaultCheckInterval = 0.3f;     // 墙外进攻怪物检测间隔（安全相关，保持 3Hz 以上）
+        private const float WorkBalanceInterval = 1f;        // 排队工作就近改派检测间隔（改派晚 1 秒无感知）
+        private const float WorkBalanceMargin = 0.5f;       // 就近改派的最小距离优势，避免频繁来回改派
         private const int PurseMaxCoins = 38;        // 钱袋容量上限（钻石占 3 金币位，有效金币上限 = 38 - 3×钻石数）
-        private const float PayHoldThreshold = 0.4f; // 长按判定阈值（秒），短点击不触发取款
+        private const float PayHoldThreshold = 0.25f; // 长按判定阈值（秒），短点击不触发取款
+        private const float BankerScanInterval = 3f;    // 银行家（税官）场景查找最小间隔（全场景遍历，两个组件共用一份缓存）
+        private const float StationSideCheckInterval = 2f;  // 传送门被毁后的驻守侧改派检测间隔（只在单侧无门时才有写操作）
+        private const int HeavySlotGapFrames = 1;           // 两个重型任务之间至少空出的帧数
         private const float SafeDistance = 20f;         // 避险安全距离：工人位置距该侧城墙外沿（无墙时距主城）超过此值且该侧有怪物出击，就跑回城墙
         private const float PlayerRunSpeedCap = 5.8f;   // 玩家奔跑最高速度：原版约 4.29，这里提升到 5.8
         private const float PlayerRunSpeedGuard = 4f;   // 判定“正在奔跑”的下限
@@ -29,9 +39,14 @@ namespace BetterKingdom
         private Player _cachedPlayer2;
         private Castle _cachedCastle;
         private Banker _cachedBanker;
-        private bool _isMenuOpen;
+        // 银行家（税官）全局缓存：本组件与地图覆盖层共用一份，场景查找按 BankerScanInterval 限频
+        private static Banker _sharedBanker;
+        private static int _sharedBankerKingdomId = -1;
+        private static float _nextBankerScan;
+        private static bool _isMenuOpen;
         private float _payHoldStartP1 = -1f, _payHoldStartP2 = -1f;
         private float _nextCacheRefresh, _nextHeavyWork, _nextWallQueueClamp;
+        private static float _nextWallBoundsScan;              // 墙体边界下一次重建时刻
         private static int _cachedKingdomId = -1;             // 用于检测换岛（Kingdom 实例变化）
         private static float _nextTimePauseCheck;             // 时间停滞检测节流时间
         private static float _lastDirectorTime = -1f;         // 上次采样到的游戏时刻（判断时钟是否真的不走）
@@ -47,9 +62,17 @@ namespace BetterKingdom
         private static readonly Dictionary<int, int> _savedKnightRank = new();
         private bool _lastDisableWallQueue;
         private static float _nextAssaultCheck;       // 下一次夜间进攻怪物检测时刻
+        private static float _nextWorkBalance;        // 下一次排队工作就近改派时刻
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _balanceWorkerBuffer;
+        // 就近改派复用的“空闲候选”池：每轮只筛一次，避免对每个排队工作重复做互操作状态查询（O(n²)）
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _balanceIdleBuffer;
+        private static float[] _balanceIdleX;
         private static bool _attackOnLeft, _attackOnRight;   // 夜晚该侧城墙外是否有进攻中的怪物
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _assaultEnemyBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _suspendWorkerBuffer;
+        // 传送门被毁后改派驻守侧时复用的工人缓冲（与避险缓冲分开，避免语义混淆）
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _stationWorkerBuffer;
+        private static float _nextStationSideCheck;   // 下一次传送门驻守侧检测时刻（周期检测）
         // 该侧出现进攻怪物时被暂时撤下的“排队工作”（还没开始做）：怪物归零后立即还给原工人。
         // 只撤排队工作、不撤 _currentWork——正在干的活按原生逻辑干完再避险。
         private struct SuspendedJob { public Worker Worker; public Workable Job; }
@@ -65,21 +88,38 @@ namespace BetterKingdom
         private static bool _chargePicking;             // 正在计算最佳小队（绕过 CanCharge 过滤）
 
         // 全局重型刷新槽位：本组件与地图覆盖层的周期刷新共用，同一帧只允许一个重型任务执行，
-        // 其余顺延到后续帧，避免多个全场景扫描/遍历叠在同一帧形成帧尖峰
-        private static int _heavySlotFrame = -1;
+        // 且相邻两个重型任务之间至少空出 HeavySlotGapFrames 帧，避免多个全场景扫描/遍历叠在连续帧上形成帧尖峰
+        private static int _heavySlotFrame = -1000;
 
         // 摇铃立即上船的待处理队列：延后一帧再 Embark，避开读档恢复乘客时游戏自身紧接着的 Embark。
         // 同一单位连续两次 Embark 会各占一个座位（第二次占座不释放），下船时重复处理导致整船人卡死。
         internal static readonly List<Embarkee> _pendingInstantBoards = new List<Embarkee>();
 
+        // ---- 摇铃选人窗口 ----
+        // 玩家付钱摇铃时先弹出选人窗口，确认后再按所选人数放行游戏原生的登船分配。
+        // 配额只作用于本次摇铃的那艘船：原生分配在给单位指派上船目标时会被拦截，
+        // 超过所选数量的单位不指派目标，因此不会出现多带人的情况。
+        private static Boat _bellSelectBoat;                 // 正在选人的船（窗口打开期间有效）
+        internal static bool _bellSummonFromPay;             // 本次 OnBoatSummonBellRang 是否由摇铃付钱触发
+        internal static bool _bellAllowNativeSummon;         // 确认/取消后放行一次原生摇铃
+        internal static bool _bellQuotaActive;               // 配额是否生效（确认后到下次摇铃）
+        private static Embarkable _bellQuotaEmbarkable;      // 配额作用的登船点（本次摇铃的船）
+        private static int _bellQuotaWorkers = -1;           // 工人上限（-1 表示不限制）
+        private static int _bellQuotaArchers = -1;           // 弓箭手上限（只统计非骑士随从）
+        private static int _bellQuotaKnights = -1;           // 骑士小队上限
+        private static readonly HashSet<int> _bellQuotaWorkerIds = new HashSet<int>();
+        private static readonly HashSet<int> _bellQuotaArcherIds = new HashSet<int>();
+        private static readonly HashSet<int> _bellQuotaKnightIds = new HashSet<int>();
+
         /// <summary>
-        /// 申请本帧唯一的重型刷新槽位。返回 false 表示本帧已有其它重型任务在执行，
-        /// 调用方不要重置自己的计时器，顺延到下一帧即可（各任务周期远大于一帧，不会饿死）。
+        /// 申请本帧的重型刷新槽位。返回 false 表示本帧或上一帧已有其它重型任务在执行，
+        /// 调用方不要重置自己的计时器，顺延到后续帧即可（各任务周期远大于一帧，不会饿死）。
+        /// 帧间隔保证：两个重型任务之间至少空出 HeavySlotGapFrames 帧，把重活摊平到多帧。
         /// </summary>
         public static bool TryReserveHeavySlot()
         {
             int frame = Time.frameCount;
-            if (frame == _heavySlotFrame) return false;
+            if (frame - _heavySlotFrame <= HeavySlotGapFrames) return false;
             _heavySlotFrame = frame;
             return true;
         }
@@ -94,6 +134,7 @@ namespace BetterKingdom
             _nextTimePauseCheck = now + 0.5f;
             _nextWallQueueClamp = now + 0.6f;
             _nextHeavyWork = now + 0.7f;
+            _nextWorkBalance = now + 0.9f;
         }
 
         private void Update()
@@ -102,6 +143,10 @@ namespace BetterKingdom
             {
                 // 读档/加载期间游戏会自己完成 Embark，本帧入队的请求已无意义，直接丢弃
                 _pendingInstantBoards.Clear();
+                // 读档/加载时游戏会自行恢复乘客，本次摇铃的配额不能再拦截这些原生指派
+                _bellQuotaActive = false;
+                _bellQuotaEmbarkable = null;
+                ClearBellQuotaUnits();
                 return;
             }
             ProcessPendingInstantBoards();
@@ -115,8 +160,17 @@ namespace BetterKingdom
             // 安全判定优先占用重型槽位，其余周期任务都可以顺延一帧，威胁检测不能漏
             if (now >= _nextAssaultCheck && TryReserveHeavySlot())
             {
-                _nextAssaultCheck = now + AssaultCheckInterval;
+                // 两侧都已确认有进攻时放宽到 1 秒复查（仍能在怪物撤离后及时恢复接活），
+                // 只有一侧确认时保持 0.3 秒，保证另一侧威胁能被快速发现
+                _nextAssaultCheck = now + ((_attackOnLeft && _attackOnRight) ? 1f : AssaultCheckInterval);
                 RefreshSideAssault();
+            }
+
+            // 排队工作就近改派：原版把新工作交给先入队的空闲工人，这里改成离工作点最近的空闲工人
+            if (now >= _nextWorkBalance && TryReserveHeavySlot())
+            {
+                _nextWorkBalance = now + WorkBalanceInterval;
+                RebalanceQueuedWork();
             }
 
             if (now >= _nextCacheRefresh && TryReserveHeavySlot())
@@ -132,8 +186,8 @@ namespace BetterKingdom
                 EnsureTimeNotStuck(now);
             }
 
-            // 禁用排队时高频复钳：游戏会在夜袭等时机经其它分配路径重新写入排队深度，
-            // 只靠分配补丁与 2 秒重活会让弓箭手先短暂走回队列站位
+            // 禁用排队时的兜底复钳：游戏会在夜袭等时机经其它分配路径重新写入排队值；
+            // 分配补丁（Archer/Knight 分派与 RankKnights）已经即时复钳，这里只低频兜底
             if (ModWindowBehaviour.DisableWallQueue && now >= _nextWallQueueClamp && TryReserveHeavySlot())
             {
                 _nextWallQueueClamp = now + WallQueueClampInterval;
@@ -142,6 +196,14 @@ namespace BetterKingdom
 
             // 钱袋国库联动（每帧：溢出即时存入，长按取款需帧级按键追踪）
             UpdatePurseTreasuryLink(now);
+
+            // 传送门被摧毁后（某侧已无传送门）把长期驻守在该侧的工人改派到另一侧，只改驻守侧。
+            // 恢复为周期检测：每 2 秒检查一次，只有“恰好一侧没有传送门”时才会写工人，其余时刻几乎零开销
+            if (now >= _nextStationSideCheck && TryReserveHeavySlot())
+            {
+                _nextStationSideCheck = now + StationSideCheckInterval;
+                ReassignStationSideAfterPortalDestroyed();
+            }
 
             if (now >= _nextHeavyWork && TryReserveHeavySlot())
             {
@@ -178,6 +240,260 @@ namespace BetterKingdom
             }
         }
 
+        // ================= 摇铃选人 =================
+
+        /// <summary>打开摇铃选人窗口：读取当前岛上三类职业的实际人数，交给设置窗口显示。</summary>
+        internal static bool BeginBellSelection(Boat boat)
+        {
+            if (boat == null) return false;
+            if (ModWindowBehaviour.IsOpen) return false;   // 设置窗口已打开时不再叠加窗口
+            Kingdom kingdom = TryGetKingdom();
+            if (kingdom == null) return false;
+
+            int maxWorkers = 0, maxArchers = 0, maxKnights = 0;
+            try { if (kingdom.Workers != null) maxWorkers = kingdom.Workers.Count; } catch { }
+            try { maxArchers = CountFreeArchers(kingdom); } catch { }
+            try { if (kingdom.Knights != null) maxKnights = kingdom.Knights.Count; } catch { }
+
+            _bellSelectBoat = boat;
+            _bellQuotaActive = false;
+            ClearBellQuotaUnits();
+            // 显示失败（原生 UI 尚未就绪等）时返回 false，调用方放行原生摇铃，避免吞掉付钱效果
+            if (!ModWindowBehaviour.ShowSailorSelect(maxWorkers, maxArchers, maxKnights))
+            {
+                _bellSelectBoat = null;
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>玩家在窗口点“确定”：按选择调整船的席位数量，再执行游戏原生摇铃分配。</summary>
+        internal static void ConfirmBellSelection(int workers, int archers, int knights)
+        {
+            Boat boat = _bellSelectBoat;
+            _bellSelectBoat = null;
+            if (boat == null) return;
+
+            bool slotsAdjusted = false;
+            try
+            {
+                AdjustBellSlots(boat, workers, archers, knights);
+                slotsAdjusted = true;
+            }
+            catch { }
+
+            try
+            {
+                // 原生分配在 OnBoatSummonBellRang 内同步完成（ToggleAllBoardingPermissions → DistributeEmbarkeesOfType），
+                // 配额只需覆盖这一次同步调用；调用结束立即清除，避免影响读档/返回旧岛时的原生指派。
+                if (slotsAdjusted)
+                {
+                    _bellQuotaEmbarkable = boat._embarkable;
+                    _bellQuotaWorkers = Mathf.Max(0, workers);
+                    _bellQuotaArchers = Mathf.Max(0, archers);
+                    _bellQuotaKnights = Mathf.Max(0, knights);
+                    ClearBellQuotaUnits();
+                    _bellQuotaActive = true;
+                }
+                InvokeNativeBellSummon(boat);
+            }
+            catch { }
+            finally
+            {
+                _bellQuotaActive = false;
+                _bellQuotaEmbarkable = null;
+                ClearBellQuotaUnits();
+            }
+        }
+
+        /// <summary>窗口被强制关闭（游戏离开游玩状态）时丢弃本次选择，不执行原生召唤。</summary>
+        internal static void AbortBellSelection()
+        {
+            _bellSelectBoat = null;
+            _bellQuotaActive = false;
+            _bellQuotaEmbarkable = null;
+            ClearBellQuotaUnits();
+        }
+
+        /// <summary>放行一次原生摇铃；放行标志避免被本模组自己的 Prefix 再次拦截。</summary>
+        private static void InvokeNativeBellSummon(Boat boat)
+        {
+            if (boat == null) return;
+            _bellAllowNativeSummon = true;
+            try { boat.OnBoatSummonBellRang(); }
+            catch { }
+            finally { _bellAllowNativeSummon = false; }
+        }
+
+        /// <summary>
+        /// 按选择调整船的登船席位：原生主船只有 3 工人、4 弓箭手、3 骑士小队。
+        /// 超过原生容量时在席位列表尾部追加 EmbarkeeSlot；少于原生容量时移除尾部空闲席位。
+        /// 骑士随从以 Stowaway（slotId=-1）方式随骑士上船，不占用弓箭手席位，因此无需为其预留。
+        /// </summary>
+        private static void AdjustBellSlots(Boat boat, int workers, int archers, int knights)
+        {
+            Embarkable embarkable = boat != null ? boat._embarkable : null;
+            if (embarkable == null) return;
+            EnsureSlotCapacity(embarkable, "Worker", Mathf.Max(0, workers));
+            EnsureSlotCapacity(embarkable, "Archer", Mathf.Max(0, archers));
+            EnsureSlotCapacity(embarkable, "Knight", Mathf.Max(0, knights));
+        }
+
+        /// <summary>把某职业的席位数量调整到 desired（尾部增删，已占用的席位不删除）。</summary>
+        private static void EnsureSlotCapacity(Embarkable embarkable, string typeName, int desired)
+        {
+            if (embarkable == null || desired < 0) return;
+            try
+            {
+                Il2CppSystem.Type key;
+                Il2CppSystem.Collections.Generic.List<EmbarkeeSlot> slots;
+                // 类型未注册席位时不做处理：主船在 OnEnable 中已为 Worker/Archer/Knight 注册原生席位，
+                // 这里只调整已有列表，避免重复注册造成状态不一致。
+                if (!TryFindSlotList(embarkable, typeName, out key, out slots)) return;
+                if (slots == null) return;
+
+                // 删除多余尾部席位：只删除空席位，避免把已经登船的单位孤立在船外
+                while (slots.Count > desired)
+                {
+                    EmbarkeeSlot last = slots[slots.Count - 1];
+                    if (last == null || last._occupant != null || last.IsOccupied) break;
+                    slots.RemoveAt(slots.Count - 1);
+                }
+                // 追加额外席位（多出的人“另外申请席位”）
+                for (int i = slots.Count; i < desired; i++)
+                    slots.Add(new EmbarkeeSlot(embarkable, key, i));
+            }
+            catch { }
+        }
+
+        /// <summary>在船的席位字典里按职业名找到对应的席位列表。</summary>
+        private static bool TryFindSlotList(Embarkable embarkable, string typeName,
+            out Il2CppSystem.Type key, out Il2CppSystem.Collections.Generic.List<EmbarkeeSlot> slots)
+        {
+            key = null;
+            slots = null;
+            try
+            {
+                var dict = embarkable._slots;
+                if (dict == null) return false;
+                var keys = dict.Keys;
+                if (keys == null) return false;
+                int count = keys.Count;
+                if (count <= 0) return false;
+                var keyArray = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Il2CppSystem.Type>(count);
+                keys.CopyTo(keyArray, 0);
+                for (int i = 0; i < count; i++)
+                {
+                    Il2CppSystem.Type t = keyArray[i];
+                    if (t == null) continue;
+                    string name = null;
+                    try { name = t.Name; } catch { }
+                    if (name == typeName)
+                    {
+                        key = t;
+                        slots = dict[t];
+                        return slots != null;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>当前岛上不属于骑士小队的自由弓箭手数量（骑士随从由骑士上船时自动携带）。</summary>
+        private static int CountFreeArchers(Kingdom kingdom)
+        {
+            int count = 0;
+            try
+            {
+                var archers = kingdom.Archers;
+                if (archers == null) return 0;
+                int total = archers.Count;
+                var buffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer>(total);
+                archers.CopyTo(buffer, 0);
+                for (int i = 0; i < total; i++)
+                {
+                    Archer archer = buffer[i];
+                    if (archer == null) continue;
+                    try { if (archer.isKnightSoldier) continue; } catch { }
+                    count++;
+                }
+            }
+            catch { }
+            return count;
+        }
+
+        private static Kingdom TryGetKingdom()
+        {
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                return managers != null ? managers.kingdom : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// 登船配额过滤：只放行所选数量以内的工人/自由弓箭手/骑士。
+        /// 骑士随从弓箭手（isKnightSoldier）随骑士行动，不占“弓箭手”名额。
+        /// 返回 false 时游戏不会给该单位指派上船目标，单位留在岸上。
+        /// </summary>
+        internal static bool AcceptBellUnit(int kind, Embarkee embarkee)
+        {
+            if (embarkee == null) return true;
+            int id;
+            HashSet<int> taken;
+            int limit;
+            switch (kind)
+            {
+                case 0: taken = _bellQuotaWorkerIds; limit = _bellQuotaWorkers; break;
+                case 1: taken = _bellQuotaArcherIds; limit = _bellQuotaArchers; break;
+                case 2: taken = _bellQuotaKnightIds; limit = _bellQuotaKnights; break;
+                default: return true;
+            }
+            if (limit < 0) return true;
+            try { id = embarkee.GetInstanceID(); } catch { return true; }
+            if (taken.Contains(id)) return true;          // 同一单位重复指派不重复占名额
+            if (taken.Count >= limit) return false;
+            taken.Add(id);
+            return true;
+        }
+
+        private static void ClearBellQuotaUnits()
+        {
+            _bellQuotaWorkerIds.Clear();
+            _bellQuotaArcherIds.Clear();
+            _bellQuotaKnightIds.Clear();
+        }
+
+        /// <summary>
+        /// 配额判定入口（Harmony Prefix 调用）：只在本次摇铃的那艘船上生效。
+        /// 骑士随从弓箭手随骑士上船，不占“弓箭手”名额。
+        /// </summary>
+        internal static bool BellQuotaAllows(Embarkee embarkee, Embarkable embarkable)
+        {
+            if (!_bellQuotaActive) return true;
+            if (embarkee == null || embarkable == null) return true;
+            if (embarkable != _bellQuotaEmbarkable) return true;
+            try
+            {
+                string typeName = null;
+                try { typeName = embarkee.UnitType != null ? embarkee.UnitType.Name : null; } catch { }
+                if (typeName == "Worker") return AcceptBellUnit(0, embarkee);
+                if (typeName == "Knight") return AcceptBellUnit(2, embarkee);
+                if (typeName == "Archer")
+                {
+                    Archer archer = embarkee.GetComponent<Archer>();
+                    bool knightSoldier = false;
+                    try { knightSoldier = archer != null && archer.isKnightSoldier; } catch { }
+                    if (knightSoldier) return true;   // 骑士随从由骑士携带，不占自由弓箭手名额
+                    return AcceptBellUnit(1, embarkee);
+                }
+                return true;
+            }
+            catch { return true; }
+        }
+
         /// <summary>
         /// 检测换岛（Kingdom 实例变化）：旧岛的墙体缓存、已取消工作全部作废，
         /// 避免拿旧岛数据判断新岛。
@@ -190,10 +506,15 @@ namespace BetterKingdom
                 if (kid == _cachedKingdomId) return;
                 _cachedKingdomId = kid;
                 _wallBounds.Clear();
+                _nextWallBoundsScan = 0f;        // 新岛必须立刻重建墙体边界
                 _suspendedJobs.Clear();
                 _pendingInstantBoards.Clear();
+                _bellQuotaActive = false;
+                _bellQuotaEmbarkable = null;
+                ClearBellQuotaUnits();
                 float now = Time.unscaledTime;
                 _nextHeavyWork = now + 0.7f;     // 换岛后错峰，避免与其它重型任务同帧执行
+                _nextStationSideCheck = 0f;      // 换岛/读档后立即做一次驻守侧改派，避免工人先跑向旧驻守侧
             }
             catch { }
         }
@@ -230,33 +551,58 @@ namespace BetterKingdom
             catch { }
 
             // 银行家（税官）缓存：FindObjectsByType(含隐藏对象) 是全场景遍历，
-            // 只有缓存失效（税官被销毁）或从未找到时才重新查找
+            // 由 ResolveBanker 分享给地图覆盖层并做 2 秒限频，避免两边各每 0.25s 扫一次场景
             try
             {
-                if (_cachedBanker != null)
-                {
-                    try { if (_cachedBanker.gameObject == null) _cachedBanker = null; } catch { _cachedBanker = null; }
-                }
-                if (_cachedBanker == null)
-                {
-                    Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                    Kingdom kingdom = managers != null ? managers.kingdom : null;
-                    if (kingdom != null)
-                    {
-                        _cachedBanker = kingdom.banker;
-                        if (_cachedBanker == null)
-                        {
-                            try
-                            {
-                                var bankers = UnityEngine.Object.FindObjectsByType<Banker>(FindObjectsInactive.Include, FindObjectsSortMode.None);
-                                if (bankers.Length > 0) _cachedBanker = bankers[0];
-                            }
-                            catch { }
-                        }
-                    }
-                }
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                _cachedBanker = ResolveBanker(kingdom);
+            }
+            catch { _cachedBanker = null; }
+        }
+
+        /// <summary>
+        /// 解析银行家（税官）：优先 kingdom.banker，其次场景查找（含隐藏对象）兜底。
+        /// 场景查找是全场景遍历，这里共用一份缓存并限频（BankerScanInterval），
+        /// 本组件与地图覆盖层都通过它取税官，避免两边各每 0.25s 扫描一次造成周期性卡顿。
+        /// </summary>
+        internal static Banker ResolveBanker(Kingdom kingdom)
+        {
+            int kingdomId = -1;
+            try { if (kingdom != null) kingdomId = kingdom.GetInstanceID(); } catch { }
+            if (kingdomId != _sharedBankerKingdomId)
+            {
+                // 换岛：旧岛的税官引用作废，立刻允许下一次场景查找
+                _sharedBankerKingdomId = kingdomId;
+                _sharedBanker = null;
+                _nextBankerScan = 0f;
+            }
+
+            // 缓存对象已被销毁时丢弃（不占用限频窗口，下一次调用可立即重找）
+            if (_sharedBanker != null)
+            {
+                try { if (_sharedBanker.gameObject != null) return _sharedBanker; } catch { }
+                _sharedBanker = null;
+            }
+            if (kingdom == null) return null;
+
+            try { _sharedBanker = kingdom.banker; } catch { _sharedBanker = null; }
+            if (_sharedBanker != null)
+            {
+                try { if (_sharedBanker.gameObject != null) return _sharedBanker; } catch { }
+                _sharedBanker = null;
+            }
+
+            float now = Time.unscaledTime;
+            if (now < _nextBankerScan) return null;
+            _nextBankerScan = now + BankerScanInterval;
+            try
+            {
+                var bankers = UnityEngine.Object.FindObjectsByType<Banker>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+                if (bankers.Length > 0) _sharedBanker = bankers[0];
             }
             catch { }
+            return _sharedBanker;
         }
 
         // 开启移速提升前各坐骑的原始奔跑速度（关闭开关时按原值还原）
@@ -413,13 +759,16 @@ namespace BetterKingdom
                 catch { }
             }
 
-            // 空袋取款：菜单/MOD 窗口打开时游戏输入被屏蔽，不判定按键；
-            // 松开按键或袋中有钱时重置计时，保证每次取款前都有一段完整的长按
+            // 空袋取款：菜单/MOD 窗口打开时游戏输入被屏蔽，不判定按键。
+            // 只在松开按键时重置计时：按住支付键移动时钱袋会被陆续花空，
+            // 若“袋里有币”也重置计时，空袋后还要重新等阈值，表现为移动中支付不跟手。
+            // 防误触语义保留：刚按下时仍要按住超过阈值，短点击不会取款。
             bool held = !_isMenuOpen && !ModWindowBehaviour.IsOpen && SafePayHeld(playerIndex);
-            if (!held || coins > 0) { holdStart = -1f; return; }
-            if (holdStart < 0f) { holdStart = now; return; }        // 开始长按计时
+            if (!held) { holdStart = -1f; return; }                 // 松键/输入屏蔽后重置，下次取款需重新长按
+            if (holdStart < 0f) holdStart = now;                    // 按下即开始计时（袋里有币也累计，空袋瞬间即可取款）
+            if (coins > 0) return;                                  // 袋里有币：保留已累计的长按时间
             if (now - holdStart < PayHoldThreshold) return;         // 未达阈值（短点击不触发）
-            holdStart = -1f;                                        // 本次长按只触发一次
+            // 触发后不清零：持续按住时，后续每次花空钱袋都能立即补款（移动中跟手）
             try
             {
                 int stash = ReadTreasury(banker, castle);
@@ -442,7 +791,8 @@ namespace BetterKingdom
         // ==================== 墙体内部守墙修正 ====================
 
         /// <summary>
-        /// 游戏原生bug修正入口：弓箭手守墙待机位有时会位于墙体内部。每隔一段时间重新收集墙体并修正。
+        /// 游戏原生bug修正入口：弓箭手守墙待机位有时会位于墙体内部。纠错类任务按 HeavyInterval 低频执行。
+        /// 禁用排队的复钳由分配补丁即时触发、另有 WallQueueClampInterval 兜底，这里不再重复执行。
         /// </summary>
         private void FixWallDefensePositions()
         {
@@ -452,10 +802,13 @@ namespace BetterKingdom
                 Kingdom kingdom = managers != null ? managers.kingdom : null;
                 if (kingdom == null) return;
 
-                // 禁用守墙排队（不依赖墙体缓存，先执行）
-                DisableWallQueueing(kingdom);
-
-                CollectWallBounds(kingdom);
+                // 墙体只在建造/被毁时变化，边界缓存按 WallBoundsScanInterval 重建即可
+                float now = Time.unscaledTime;
+                if (_wallBounds.Count == 0 || now >= _nextWallBoundsScan)
+                {
+                    CollectWallBounds(kingdom);
+                    _nextWallBoundsScan = now + WallBoundsScanInterval;
+                }
                 if (_wallBounds.Count == 0) return;
                 // 需要城堡位置判断"墙后"是哪一侧
                 if (!TryGetX(kingdom.castle, out float castleX)) return;
@@ -652,6 +1005,9 @@ namespace BetterKingdom
                     if (k == null) continue;
                     try
                     {
+                        // 正在去拿取铁剑（盔甲）的路上不要动 rank：目标站位由 rank 推导，
+                        // 中途改 rank 会让状态机把它判成“该回城墙”，打断拿取动作
+                        if (k._targetArmor != null) continue;
                         // rank 从 1 起算，1 = 墙后最近的一排；归 1 即取消骑士序列
                         int rank = k.rank;
                         if (rank > 1)
@@ -967,6 +1323,10 @@ namespace BetterKingdom
                 {
                     Worker w = _suspendWorkerBuffer[i];
                     if (w == null) continue;
+                    // 工人自身已在危险位置：先把手上的活全部卸下，否则 Work 状态优先于 Shelter，
+                    // 只改 ShouldShelter 的结果它仍然会去干活而不回城墙
+                    if (ShouldFleeToWall(w)) { ReleaseWorkerWork(w); continue; }
+
                     Workable job;
                     try { job = w._queuedWork; } catch { continue; }
                     if (job == null) continue;
@@ -979,6 +1339,239 @@ namespace BetterKingdom
                     try { if (w._queuedWork == job) w._queuedWork = null; } catch { }
                     if (_suspendedJobs.Count < 64)
                         _suspendedJobs.Add(new SuspendedJob { Worker = w, Job = job });
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 卸下工人的当前工作与排队工作，让它不再满足 Work 状态条件，从而进入 ShouldShelter 的 Shelter 状态回城。
+        /// 仅用于“工人自身已处在危险位置”的情况：状态选择里 Work 优先级高于 Shelter，
+        /// 不卸工作的话工人会一路走到危险区把活干完才肯撤退（原生行为）。
+        /// 当前工作走游戏自己的 ResetWorkState(false) 收工流程，释放工作位并触发一次原生重分配。
+        /// </summary>
+        private static void ReleaseWorkerWork(Worker w)
+        {
+            if (w == null) return;
+            try
+            {
+                Workable current;
+                try { current = w._currentWork; } catch { current = null; }
+                if (current != null)
+                {
+                    try { w.ResetWorkState(false); }
+                    catch
+                    {
+                        try { current.CancelWork(w); } catch { }
+                        try { if (w._currentWork == current) w._currentWork = null; } catch { }
+                    }
+                }
+
+                Workable queued;
+                try { queued = w._queuedWork; } catch { queued = null; }
+                if (queued != null)
+                {
+                    try { queued.CancelWork(w); } catch { }
+                    try { if (w._queuedWork == queued) w._queuedWork = null; } catch { }
+                }
+                try { w._forceWork = false; } catch { }
+
+                // 状态选择里还有两个优先级高于 Shelter 的状态，同样会挡住回城：
+                //   128 = 正在拾取地面掉落物（_targetTool 非空），256 = 在队列中（currentFormation 非空）。
+                // 工人已处在危险位置时放弃拾取目标、退出队列，状态选择才会落到 Shelter。
+                try { if (w._targetTool != null) w.SetDroppableTarget(null); } catch { }
+                try
+                {
+                    Formation formation = w.currentFormation;
+                    if (formation != null)
+                        formation.UnregisterUnit(w.Cast<Formation.IFormationUnit>());
+                }
+                catch
+                {
+                    try { w.OnLeaveFormation(); } catch { }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 传送门被摧毁后（某侧已无任何传送门）把长期驻守在该侧的工人改派到另一侧。
+        /// 只改 Worker._targetSide——它只决定工人在 Shelter/待机时蹲哪一侧城墙（游戏在
+        /// Worker.Behaviour 里用它算避难点）；工作分配、_currentWork/_queuedWork、队形、拾取目标一律不动，
+        /// 因此工人仍可来该侧工作，改派跑向另一侧的过程中也照常接活。
+        /// 判定依据是 Kingdom.closestPortal：传送门被摧毁时 Portal.Crumble 会 RemovePortal 并销毁对象，
+        /// Kingdom 随即重算左右最近传送门，该侧变成 null。只有“恰好一侧没有传送门、另一侧还有”时才改派，
+        /// 两侧都没有传送门时保持原样，避免工人来回改派。改派是事件驱动的：传送门被毁时全量处理一次，
+        /// 之后新生成/读档恢复/被游戏改写所属侧的工人由 Worker.OnEnable、Worker.SetWorkerSide 补丁即时写死，
+        /// 不再周期性扫描工人。
+        /// </summary>
+        private static void ReassignStationSideAfterPortalDestroyed()
+        {
+            try
+            {
+                Side? destroyedSide = GetMissingPortalSide();
+                if (destroyedSide == null) return;
+                Side targetSide = destroyedSide.Value == Side.Left ? Side.Right : Side.Left;
+
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return;
+                var workers = kingdom.Workers;
+                if (workers == null || workers.Count <= 0) return;
+                if (_stationWorkerBuffer == null || _stationWorkerBuffer.Length < workers.Count)
+                    _stationWorkerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(workers.Count, 16));
+                workers.CopyTo(_stationWorkerBuffer, 0);
+
+                int count = workers.Count;
+                for (int i = 0; i < count; i++)
+                {
+                    Worker w = _stationWorkerBuffer[i];
+                    if (w == null) continue;
+                    try
+                    {
+                        if (w._targetSide != destroyedSide.Value) continue;
+                        w._targetSide = targetSide;   // 仅切驻守侧，其它状态一概不碰
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 工人启用（读档恢复/新生成）时立即按当前传送门状态写死驻守侧。
+        /// 原生 OnEnable 会先按城堡位置初始化 _targetSide，这里紧接着纠正，避免工人先跑向旧驻守侧、
+        /// 直到夜间重新决策才绕回来（周期检测只改值，无法打断已经开始的那段移动）。
+        /// </summary>
+        internal static void ApplyStationSideToWorker(Worker worker)
+        {
+            if (worker == null) return;
+            try
+            {
+                Side? missingSide = GetMissingPortalSide();
+                if (missingSide == null) return;
+                if (worker._targetSide == missingSide.Value)
+                    worker._targetSide = missingSide.Value == Side.Left ? Side.Right : Side.Left;
+            }
+            catch { }
+        }
+
+        /// <summary>恰好一侧没有传送门、另一侧还有时返回该缺失侧；两侧都有或都没有时返回 null。</summary>
+        private static Side? GetMissingPortalSide()
+        {
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return null;
+                Sided<Portal> portals = kingdom.closestPortal;
+                if (portals == null) return null;
+                Portal left, right;
+                try { left = portals.left; } catch { return null; }
+                try { right = portals.right; } catch { return null; }
+                if (left == null && right != null) return Side.Left;
+                if (right == null && left != null) return Side.Right;
+                return null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// 把“已分配但还没开始”的排队工作改派给离工作点最近的空闲工人。
+        /// 原版 ActorTracker 按工人集合的固定顺序分配，先入队/先遍历的工人先接活，
+        /// 经常出现远处的工人拿到工作、近处的空闲工人反而没活。
+        /// 这里只动 _queuedWork（未开工），不打断已经在做的工作；危险工作点留给避险逻辑处理。
+        /// </summary>
+        private static void RebalanceQueuedWork()
+        {
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return;
+                var workers = kingdom.Workers;
+                if (workers == null) return;
+                int count = workers.Count;
+                if (count <= 1) return;
+
+                if (_balanceWorkerBuffer == null || _balanceWorkerBuffer.Length < count)
+                    _balanceWorkerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(count, 16));
+                workers.CopyTo(_balanceWorkerBuffer, 0);
+
+                // 先筛一次“可接活的空闲工人”池，供本轮所有排队工作共用。
+                // 原实现在每个排队工作上重复检查全部工人的空闲/避险状态，是 O(n²) 的互操作调用；
+                // 筛成池后内层只剩浮点距离比较，1 秒一轮也不会形成帧尖峰。
+                if (_balanceIdleBuffer == null || _balanceIdleBuffer.Length < count)
+                    _balanceIdleBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(count, 16));
+                if (_balanceIdleX == null || _balanceIdleX.Length < count)
+                    _balanceIdleX = new float[count];
+
+                int idleCount = 0;
+                for (int j = 0; j < count; j++)
+                {
+                    Worker candidate = _balanceWorkerBuffer[j];
+                    if (candidate == null) continue;
+                    bool idle;
+                    try { idle = candidate._currentWork == null && candidate._queuedWork == null; }
+                    catch { idle = false; }
+                    if (!idle) continue;                              // 只考虑完全空闲的工人
+                    try { if (candidate.HasEmbarkableTarget()) continue; } catch { }
+                    if (ShouldFleeToWall(candidate)) continue;        // 正在避险回城的工人不再接活
+                    float candidateX;
+                    if (!TryGetX(candidate, out candidateX)) continue;
+                    _balanceIdleBuffer[idleCount] = candidate;
+                    _balanceIdleX[idleCount] = candidateX;
+                    idleCount++;
+                }
+
+                for (int i = 0; i < count && idleCount > 0; i++)
+                {
+                    Worker holder = _balanceWorkerBuffer[i];
+                    if (holder == null) continue;
+
+                    Workable job;
+                    bool holderBusyWithOther;
+                    try
+                    {
+                        job = holder._queuedWork;
+                        holderBusyWithOther = holder._currentWork != null;
+                    }
+                    catch { continue; }
+                    if (job == null || holderBusyWithOther) continue;   // 已在干活的不打断，改派只针对尚未开工的排队工作
+
+                    float jobX, holderX;
+                    if (!TryGetX(job, out jobX) || !TryGetX(holder, out holderX)) continue;
+                    if (!IsWorkSpotSafe(kingdom, jobX)) continue;       // 危险工作点交给避险逻辑，不参与改派
+                    float holderDist = Mathf.Abs(jobX - holderX);
+
+                    Worker best = null;
+                    float bestDist = holderDist;
+                    int bestSlot = -1;
+                    for (int j = 0; j < idleCount; j++)
+                    {
+                        Worker candidate = _balanceIdleBuffer[j];
+                        if (candidate == null) continue;                  // 本轮已被前面的工作改派走
+                        float d = Mathf.Abs(jobX - _balanceIdleX[j]);
+                        if (d < bestDist - WorkBalanceMargin)
+                        {
+                            bestDist = d;
+                            best = candidate;
+                            bestSlot = j;
+                        }
+                    }
+                    if (best == null) continue;
+
+                    // 走游戏自己的取消/接活接口，保证工作位占用记录同步
+                    try { job.CancelWork(holder); }
+                    catch { continue; }
+                    try { if (holder._queuedWork == job) holder._queuedWork = null; } catch { }
+
+                    bool available;
+                    try { available = job.JobAvailable(); } catch { available = true; }
+                    if (!available) continue;    // 工作位此刻不可用，留给游戏原生重分配
+
+                    try { best.AssignJob(job); } catch { }
+                    if (bestSlot >= 0) _balanceIdleBuffer[bestSlot] = null;   // 已接活，移出候选池
                 }
             }
             catch { }
@@ -1073,6 +1666,22 @@ namespace BetterKingdom
         // ==================== 攻门（付费冲锋）小队优先级 ====================
 
         /// <summary>
+        /// 是否为“高级骑士”（用铁剑晋升的骑士）。
+        /// 不能用 _wasPromoted 判断：该字段只在 Knight.OnKnightPromote 里把“被替换下场的旧侍从”置为 true，
+        /// 旧对象随后就被 Character.Promote 回收；而 Knight.OnEnable 又会把该字段清零，
+        /// 因此活着的晋升骑士此字段恒为 false（此前“满员时仍不优先高级骑士”就是这个原因）。
+        /// 游戏用 GameObject tag 区分：侍从为 "Squire"、晋升骑士为 "Knight"（Character.Promote/Demote 可证），
+        /// 这里以 tag 为准，_wasPromoted 仅作兜底。
+        /// </summary>
+        internal static bool IsAdvancedKnight(Knight k)
+        {
+            if (k == null) return false;
+            try { if (k.CompareTag("Knight")) return true; } catch { }
+            try { return k._wasPromoted; } catch { }
+            return false;
+        }
+
+        /// <summary>
         /// 付费攻门时挑选出动小队：先比人数（满员优先），人数相同优先高级骑士，再比距离（更近优先）。
         /// 原版在 Kingdom.Knights 哈希集上遍历、只按弓箭手人数取最大值，人数相同则"后遍历者"胜出，
         /// 顺序随机且不看骑士等级。
@@ -1114,8 +1723,7 @@ namespace BetterKingdom
                     int count;
                     try { count = k.numArchers; } catch { count = 0; }
                     if (count <= 0) continue;
-                    bool promoted;
-                    try { promoted = k._wasPromoted; } catch { promoted = false; }
+                    bool promoted = IsAdvancedKnight(k);
 
                     bool better;
                     if (count != bestCount) better = count > bestCount;
@@ -1357,6 +1965,12 @@ namespace BetterKingdom
     [HarmonyPatch(typeof(Embarkee), nameof(Embarkee.SetEmbarkableTarget))]
     public static class EmbarkeeInstantBoardPatch
     {
+        /// <summary>摇铃选人配额：超过所选人数的单位不指派上船目标（返回 false 跳过原生方法）。</summary>
+        public static bool Prefix(Embarkee __instance, Embarkable embarkable)
+        {
+            return FeatureBehaviour.BellQuotaAllows(__instance, embarkable);
+        }
+
         public static void Postfix(Embarkee __instance, Embarkable embarkable)
         {
             if (!ModWindowBehaviour.BellInstantBoard) return;
@@ -1410,24 +2024,52 @@ namespace BetterKingdom
     }
 
     /// <summary>
+    /// 骑士正在去拿取铁剑（盔甲掉落 _targetArmor 非空）的路上时，禁止“回城墙驻守”的判定成立。
+    /// “回城墙”的目标站位由 rank 推导，状态机在行走途中会反复评估 ShouldGoToWall，
+    /// 一旦成立就会中断 GrabArmor 协程、把骑士拉回墙边（改 rank 时尤其明显）。
+    /// 这里在拿取动作完成（_targetArmor 被清空）之前一律返回 false，保证拿取铁剑的过程不被打断；
+    /// 拿到铁剑后恢复原生判定。DisableWallQueueing 也会跳过这类骑士，不动它们的 rank。
+    /// </summary>
+    [HarmonyPatch(typeof(Knight), nameof(Knight.ShouldGoToWall))]
+    public static class KnightKeepArmorGrabPatch
+    {
+        public static bool Prefix(Knight __instance, ref bool __result)
+        {
+            try
+            {
+                if (__instance != null && __instance._targetArmor != null)
+                {
+                    __result = false;
+                    return false;   // 跳过原生判定
+                }
+            }
+            catch { }
+            return true;
+        }
+    }
+
+    /// <summary>
     /// 拒绝不安全的墙外工作：该工作点所属侧有怪物出击、且工作点超出安全距离时，不论哪个工人来接手一律拒绝，
     /// 直到该侧进攻怪物归零。判定只看工作点，不看工人当前在哪一侧——左侧出怪时右侧工人也不能接左侧危险活。
-    /// 已经在做的活不受影响（Work 优先级高于 Shelter，干完后由 ShouldShelter 补丁带回城墙），
-    /// 与“不干预工作行为”一致；该侧无怪物、工作点墙内或安全距离内一律放行。
+    /// 另外，工人自身已处在安全距离之外、正在避险回城时也不再接新活，避免它被重新派出去。
+    /// 该侧无怪物、工作点墙内或安全距离内一律放行。
     /// </summary>
     [HarmonyPatch(typeof(Worker), nameof(Worker.AssignJob))]
     public static class WorkerAssignSafeJobPatch
     {
-        public static bool Prefix(Workable job)
+        public static bool Prefix(Worker __instance, Workable job)
         {
-            return FeatureBehaviour.CanStartWork(job);
+            if (!FeatureBehaviour.CanStartWork(job)) return false;
+            if (__instance != null && FeatureBehaviour.ShouldFleeToWall(__instance)) return false;
+            return true;
         }
     }
 
     /// <summary>
     /// 最后一道防线：任何把排队工作转成“当前工作”的路径（包括绕过 AssignJob 的付费接活）都会被拦下。
     /// Worker.Behaviour 协程里 SetCurrentWork(_queuedWork) 是唯一的转换漏斗，工作点在进攻侧安全距离外时
-    /// 拒绝启动并释放工作位；传 null 的调用（清空工作）一律放行。
+    /// 拒绝启动并释放工作位；工人自身正在避险回城时也拒绝启动，保证它先回到城墙。
+    /// 传 null 的调用（清空工作）一律放行。
     /// </summary>
     [HarmonyPatch(typeof(Worker), nameof(Worker.SetCurrentWork))]
     public static class WorkerSetCurrentWorkSafePatch
@@ -1435,7 +2077,8 @@ namespace BetterKingdom
         public static bool Prefix(Worker __instance, Workable __0)
         {
             if (__0 == null) return true;
-            if (FeatureBehaviour.CanStartWork(__0)) return true;
+            bool fleeing = __instance != null && FeatureBehaviour.ShouldFleeToWall(__instance);
+            if (!fleeing && FeatureBehaviour.CanStartWork(__0)) return true;
             try { __0.CancelWork(__instance); } catch { }   // 释放工作位，避免之后同类工作再也分配不出去
             try { if (__instance != null && __instance._queuedWork == __0) __instance._queuedWork = null; } catch { }
             return false;
@@ -1462,9 +2105,9 @@ namespace BetterKingdom
     /// 白天（或换岛后王国被兜底转成安全态）即使本侧有怪物出击，工人也不会退回城墙。
     /// 这里在“该侧有怪物出击 + 工人自身已在安全距离之外”时强制结果取真，
     /// 让游戏自己的 Shelter 状态把工人带回城墙驻守，直到该侧进攻怪物归零。
-    /// 不干预工作：Work 状态优先级高于 Shelter，正在干活的工会先干完再撤退（与游戏原生一致）。
-    /// 注意：只改状态选择结果，全程不碰 Kingdom.isSafe 与 Director 时钟，
-    /// 因此不会重新引发“复仇血月结束后时间卡住”的问题。
+    /// 注意状态选择里 Work 优先级高于 Shelter，因此 FeatureBehaviour 会在同一判定成立时
+    /// 先卸下工人的当前/排队工作（ReleaseWorkerWork），否则工作状态会盖过避险状态。
+    /// 全程不碰 Kingdom.isSafe 与 Director 时钟，因此不会重新引发“复仇血月结束后时间卡住”的问题。
     /// </summary>
     [HarmonyPatch(typeof(Worker), nameof(Worker.ShouldShelter))]
     public static class WorkerRecallShelterPatch
@@ -1473,6 +2116,19 @@ namespace BetterKingdom
         {
             if (__result || __instance == null) return;
             if (FeatureBehaviour.ShouldFleeToWall(__instance)) __result = true;
+        }
+    }
+
+    /// <summary>
+    /// 工人启用（读档恢复/新生成）后立即纠正驻守侧：原生 OnEnable 已先按城堡侧初始化，
+    /// 只靠每 2 秒的周期检测会让工人在读档后先跑向旧驻守侧，直到夜间才回到改派侧。
+    /// </summary>
+    [HarmonyPatch(typeof(Worker), "OnEnable")]
+    public static class WorkerStationSideOnEnablePatch
+    {
+        public static void Postfix(Worker __instance)
+        {
+            FeatureBehaviour.ApplyStationSideToWorker(__instance);
         }
     }
 
@@ -1505,6 +2161,46 @@ namespace BetterKingdom
         {
             if (!__result || __instance == null) return;
             if (!FeatureBehaviour.AllowChargeCandidate(__instance)) __result = false;
+        }
+    }
+
+    /// <summary>
+    /// 标记“本次摇铃付钱”流程：只有付钱触发的摇铃才弹选人窗口；
+    /// 读档时 Boat.ApplyData 也会调用 OnBoatSummonBellRang 恢复乘客，那种情况必须直接放行。
+    /// </summary>
+    [HarmonyPatch(typeof(BoatSummoningBell), nameof(BoatSummoningBell.Pay))]
+    public static class BoatSummoningBellPayPatch
+    {
+        public static void Prefix()
+        {
+            FeatureBehaviour._bellSummonFromPay = true;
+        }
+
+        public static void Postfix()
+        {
+            FeatureBehaviour._bellSummonFromPay = false;
+        }
+    }
+
+    /// <summary>
+    /// 摇铃后先弹出选人窗口，拦截本次原生召唤；玩家确认/取消后再由本模组主动调用原生方法。
+    /// 这样船的 HasSummonedPassengers、各舰队船状态等副作用仍由原生逻辑完成。
+    /// </summary>
+    [HarmonyPatch(typeof(Boat), nameof(Boat.OnBoatSummonBellRang))]
+    public static class BoatSummonBellSelectPatch
+    {
+        public static bool Prefix(Boat __instance)
+        {
+            if (FeatureBehaviour._bellAllowNativeSummon) return true;
+            // 读取后立即消费标志：即使 Pay 内部抛异常导致 Postfix 未执行，也不会让标志悬挂到之后的
+            // 读档恢复（Boat.ApplyData）调用上，避免读档时误弹选人窗口。
+            bool fromPay = FeatureBehaviour._bellSummonFromPay;
+            FeatureBehaviour._bellSummonFromPay = false;
+            // 非付钱触发的调用（读档恢复乘客）不弹窗
+            if (!fromPay) return true;
+            if (__instance == null) return true;
+            // 窗口显示成功则跳过原生召唤，等玩家确认后再调用
+            return !FeatureBehaviour.BeginBellSelection(__instance);
         }
     }
 }
