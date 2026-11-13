@@ -458,26 +458,10 @@ namespace BetterKingdom
                         _hasCoins = true;
                     }
 
-                    // 路径1：Castle._currentCoinCount（城堡 UI 显示的金币堆数量）
-                    int castleCoins = 0;
-                    Castle castle = kingdom.castle;
-                    if (castle != null)
-                    {
-                        try { castleCoins = castle._currentCoinCount; } catch { }
-                    }
-
-                    // 路径2：Banker._stashedCoins（Banker 藏匿的金币）
-                    int bankerCoins = 0;
-                    // 税官解析与限频由 FeatureBehaviour 统一负责（场景查找是全场景遍历，
-                    // 两边各每 0.25s 扫一次会造成周期性卡顿）
-                    Banker banker = FeatureBehaviour.ResolveBanker(kingdom);
-                    if (banker != null)
-                    {
-                        try { bankerCoins = banker._stashedCoins; } catch { }
-                    }
-
-                    // 取两者中较大的值作为国库金币
-                    treasury = Math.Max(castleCoins, bankerCoins);
+                    // 国库：真实账本是 Banker._stashedCoins（存档 BankerData.stashedCoins）；
+                    // Castle._currentCoinCount 只是城堡金币堆的显示镜像（RPC 同步，可能不随支出回退）。
+                    // 不能对两者取 Max：镜像滞后时旧的大值会一直胜出，表现为“只加不减”。
+                    treasury = FeatureBehaviour.ReadTreasury(FeatureBehaviour.ResolveBanker(kingdom), kingdom.castle);
                 }
                 catch { }
 

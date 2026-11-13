@@ -722,7 +722,7 @@ namespace BetterKingdom
         }
 
         /// <summary>读国库账本：优先税官账本（Banker._stashedCoins），无税官时回退城堡显示字段。</summary>
-        private static int ReadTreasury(Banker banker, Castle castle)
+        internal static int ReadTreasury(Banker banker, Castle castle)
         {
             if (banker != null) { try { return banker._stashedCoins; } catch { } }
             try { return castle._currentCoinCount; } catch { return 0; }
