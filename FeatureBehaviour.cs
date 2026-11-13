@@ -728,11 +728,16 @@ namespace BetterKingdom
             try { return castle._currentCoinCount; } catch { return 0; }
         }
 
-        /// <summary>写国库账本：税官账本与城堡显示镜像同步写，避免税官下次存钱时用旧账本覆盖显示造成"回弹"。</summary>
+        /// <summary>
+        /// 写国库账本：税官账本 + 城堡金币堆显示同步刷新。
+        /// 必须调用 Castle.SetStash 立即重绘金币堆——只写字段/CallSendStashCount 时，
+        /// 画面要等游戏自己花钱或税官下次存钱才更新，表现为“国库显示不随取款/存款变化”。
+        /// </summary>
         private static void WriteTreasury(Banker banker, Castle castle, int value)
         {
             if (banker != null) { try { banker._stashedCoins = value; } catch { } }
             try { castle._currentCoinCount = value; } catch { }
+            try { castle.SetStash(value); } catch { }
             try { castle.SendStashCount(); } catch { }
         }
 
