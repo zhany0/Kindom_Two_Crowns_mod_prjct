@@ -106,8 +106,8 @@
    `Knight.ShouldGoToWall` 会比较当前位置与 `GetTargetPos()`，因此写回 `rank` 后骑士会自行重新走位，无需调用 `RankKnights()`。
    `Pikeman` 有独立的三格墙位（`Pikeman.Assign(Wall, readiness)`，站位含 `3-readiness`），不是长队；`Berserker` 只有固定 `distanceFromWall`，无排队序号。
 6. **工人墙外避险**：不区分昼夜，某侧存在"进攻状态"怪物且工人自身位置在该侧安全距离之外时，工人跑回城墙驻守，直到该侧进攻怪物数量为 0。
-   进攻判据：`!Enemy.IsDespawning && !Enemy.shouldRetreat && !damageable.isDead && gameObject.activeSelf && Enemy.loot == null`（`loot` 非空＝已拖着金币/战利品撤回传送门）；`Enemy` 无侧别字段，用 x 与 `kingdom.castle` 的 x 比较分侧，检测结果缓存 0.2s（`RefreshSideAssault`）。
-   安全距离：墙内始终安全；墙外要求距该侧城墙外沿 ≤ `SafeDistance`（20）；该侧还没有城墙时从主城（`kingdom.castle`）位置起算（`TryGetOuterWallX` 里已处理）。
+   进攻判据：`!Enemy.IsDespawning && !Enemy.shouldRetreat && !damageable.isDead && gameObject.activeSelf && Enemy.loot == null`（`loot` 非空＝已拖着金币/战利品撤回传送门）；**死亡还必须覆盖“血量已空但 isDead 尚未置位”的死亡动画期**（`hitPoints <= 0 && initialHitPoints > 0` 视为已死），否则怪物死光后该侧威胁会多挂一段时间、工人白跑一趟；`Enemy` 无侧别字段，用 x 与 `kingdom.castle` 的 x 比较分侧，检测周期 `AssaultCheckInterval`(0.3s，两侧都已确认有进攻时放宽到 0.5s)（`RefreshSideAssault`）。
+   安全距离：墙内始终安全；墙外要求距该侧城墙外沿 ≤ `SafeDistance`（15，2026-11 由 20 下调）；该侧还没有城墙时从主城（`kingdom.castle`）位置起算（`TryGetOuterWallX` 里已处理）。
    实现只用 `Worker.ShouldShelter` 的 Postfix 强制返回真：原生实现首行是 `if (kingdom.isSafe) return false`，白天会被游戏的安全态按掉，所以才需要补丁。判据 `ShouldFleeToWall` 只看工人自身位置。
    **统一判据（按工作点，不按工人所在侧）**：`IsWorkSpotSafe(kingdom, x)` 先用 x 与 `kingdom.castle` 的 x 分侧（与怪物分侧口径一致，取不到城堡时退回露营火堆位置），再走 `IsPositionSafe`。该侧有怪且工作点在安全距离外即为不安全，**任何人都不许接**。
    ①`Worker.AssignJob(Workable)` Prefix 一律拒绝不安全工作点（`WorkerAssignSafeJobPatch`）——左侧出怪时，右侧工人也接不到左侧的危险活；②`SuspendUnsafeQueuedWork` 遍历 `kingdom.Workers` 撤下所有**已分配但还没开始**的不安全 `_queuedWork`（不再按侧分流，与 Prefix 同一判据，工作往往在怪物出现前就已分配好，Prefix 管不到）；③**不撤 `_currentWork`**：正在干的活按原生优先级（Work > Shelter）干完再回城（`CancelWork`/`ResetWorkState` 打断工作会引发恢复难题）。
@@ -120,23 +120,30 @@
 7. **钱袋与国库共通**：真实国库账本是 `Banker._stashedCoins`（存档走 `BankerData.stashedCoins`）；
    `Castle._currentCoinCount` 只是城堡金币堆的显示镜像（`SendStashCount`/`RecvStashCount` RPC 同步，`Castle.stash` + `stashHeight` 按数量画高度），**不参与存档**。
    因此国库未解锁（场景里没有 `Banker`）时整个联动必须关闭，否则溢出金币写进显示字段会丢失、取款还会凭空造币。判定入口：`_cachedBanker == null` 直接 return。
+   钱袋容量 `PurseMaxCoins`(38)，钻石各占 3 个金币位：有效上限 = 38 - 3×钻石数（下限 0）；溢出部分自动存入国库，空袋长按支付键（`PayHoldThreshold` 0.25s）从国库取回。
+   **写账本后必须立刻重绘金币堆**：`Castle.SetStash(int)` 才是更新金币堆高度/画面的入口（`_currentCoinCount` 只是字段，游戏只在自身花钱或税官下次存钱时才主动重绘）。
+   统一走 `FeatureBehaviour.WriteTreasury(banker, castle, value)`：写 `_stashedCoins` → 写 `_currentCoinCount` → `castle.SetStash(value)` → `castle.SendStashCount()`；漏掉 `SetStash` 时表现为“存入/取款后金币堆要等一会儿才变”。
+   面板读数统一走 `FeatureBehaviour.ReadTreasury(banker, castle)`（优先 `_stashedCoins`，无税官回退 `_currentCoinCount`），**不要对两者取 Max**：镜像滞后时旧的大值会一直胜出，表现为“只加不减”。
 8. **付费攻门小队优先级**：入口是 `PayableBorder.Pay()`（玩家付费后由 `Payable.PerformPay()` 虚调用），原版在 `Kingdom.Knights` 哈希集上遍历，只按 `Knight.numArchers` 取最大，人数相同则"后遍历者"胜出（顺序随机），不看骑士等级。
-   模组做法：`PayableBorder.Pay` Prefix 里按 `CanCharge()` + `|kx-border.x| <= knightRange` 筛出候选，排序键为 人数 > 高级骑士 > 距离更近，记下实例 ID；同期间 `Knight.CanCharge` Postfix 只放行该 ID，使原版循环必然选中它；Postfix 清理上下文。计算候选时用 `_chargePicking` 标志绕过 `CanCharge` 自身过滤，避免递归。
-   **高级骑士判定必须用 tag，不能用 `_wasPromoted`**：该字段只在 `Knight.OnKnightPromote` 里把被替换下场的旧侍从置 1（随后旧对象被 `Character.Promote` 回收），且 `Knight.OnEnable` 会清零，活着的晋升骑士恒为 false。游戏用 GameObject tag 区分：侍从 `Squire`、晋升骑士 `Knight`（`Character.Promote`/`Demote` 的 `CompareTag` 可证）。统一走 `FeatureBehaviour.IsAdvancedKnight(k)`。
+   模组做法：`PayableBorder.Pay` Prefix 里按 `CanCharge()` + `|kx-border.x| <= knightRange` 筛出候选，排序键为 人数 > 高级骑士评分 > 距离更近，记下实例 ID；同期间 `Knight.CanCharge` Postfix 只放行该 ID，使原版循环必然选中它；Postfix 清理上下文。计算候选时用 `_chargePicking` 标志绕过 `CanCharge` 自身过滤，避免递归。
+   **高级骑士判定**：`KnightAdvancedScore(k)` 多信号打分——`CompareTag("Knight")` 记 2 分（侍从是 `Squire`），`!k.NeedsArmor`（已领到铁甲）记 1 分；`IsAdvancedKnight` = 分数 > 0。不能用 `_wasPromoted`：该字段只在 `Knight.OnKnightPromote` 里把被替换下场的旧侍从置 1（随后旧对象被 `Character.Promote` 回收），且 `Knight.OnEnable` 会清零，活着的晋升骑士恒为 false。
+   **过滤只在 Pay 执行期间生效**（`ChargeFilterActive` = `_chargePickActive && _chargeHasPick`），`FinishChargePick` 立即关闭：若延长到付钱之后，其它骑士的 `CanCharge` 被判 false，游戏会认为该侧暂无可用小队而短暂禁止继续付钱，破坏原版连续出动节奏。
+   **不能用 `_chargeBestId >= 0` 判断“是否已选中”**：IL2CPP `GetInstanceID()` 可能返回负数（实测 -50054 等），必须用独立标志 `_chargeHasPick`。
+   **不要给 `Knight.set__shouldCharge` 打补丁**：`_shouldCharge` 在 IL2CPP 里是字段访问器，Harmony 报 “is a field accessor, it can't be patched” 并退回普通补丁方式，写坏访问器导致游戏闪退。同理不要在 Pay 之外主动调 `Knight.DoCharge()` 或批量写 `_shouldCharge` 干预状态机（曾引发闪退），只做“Pay 期间过滤 + 选人结果”。
    小队人数 = `Knight._archers` 的 `Count`（`numArchers`），上限 `_maxArchers`（prefab 值 4）；`_numAdditionalChargeFollowers` 是冲锋时招募狂战士的参数，不是人数依据。
 9. **周期刷新不能同帧叠加**：`FeatureBehaviour` 与 `MapOverlayBehaviour` 的各周期任务（进攻检测、缓存、墙体修正、洞窟/油桶/农田全场景扫描、中/重刷新）
     共用同一个“本帧唯一重型槽位” `FeatureBehaviour.TryReserveHeavySlot()`（按 `Time.frameCount` 记账）：抢不到槽位的任务**不重置计时器**，顺延到后续帧。
     槽位还要求相邻两个重型任务之间至少空出 `HeavySlotGapFrames`(1) 帧，把重活摊平到多帧，避免连续帧都压着重任务形成卡顿。
     各任务周期都远大于一帧，因此不会饿死；安全检测放在 Update 最前，优先拿槽位。
     `Awake` 里按不同相位初始化计时器（0/0.1/0.5/0.6/0.7s），避免首帧全部到期后连续多帧排队。每帧仍照常执行的任务只有 `UpdatePurseTreasuryLink`、`SyncWallQueueSwitch`、`EnsureTimeNotStuck`（都很轻且需要帧级/秒级精度）。
-    **总体节奏（2026-11 调优后）**：进攻检测 0.3s、缓存 0.5s、禁用排队复钳 1s（分配补丁已即时复钳，这里只兜底）、就近改派 1s、墙体纠错 3s（墙体边界 5s 重建）。地图覆盖层：轻刷新 20Hz、中刷新 2Hz、重刷新 3s、油桶 8s、农田 5s；驻守侧改派已改为事件驱动（传送门摧毁/工人启用/SetWorkerSide/换岛），无周期扫描；洞窟、城堡、坐骑、科技点均按“本岛只采集一次”缓存（换岛由 `ResetIslandCaches` 清空）。
+    **总体节奏（2026-11 调优后）**：进攻检测 0.3s（两侧都有进攻时 1s）、缓存 0.5s、禁用排队复钳 1s（分配补丁已即时复钳，这里只兜底）、就近改派 1s、墙体纠错 3s（墙体边界 5s 重建）。地图覆盖层：轻刷新 10Hz（玩家位置改成每帧单独读）、中频 0.15s（时间/季节/职业/金币/火油桶）、重刷新 3s、火油桶来源扫描 5s、农田 20s、民房 20s、城墙建造位 30s；驻守侧改派已改为事件驱动（传送门摧毁/工人启用/SetWorkerSide/换岛），无周期扫描；洞窟、城堡、坐骑、科技点、雕像、宝箱均按“本岛只采集一次”缓存（换岛由 `ResetIslandCaches` 清空）。
     `RebalanceQueuedWork` 先筛一次空闲候选池（`_balanceIdleBuffer`/`_balanceIdleX`），内层只做浮点距离比较；原实现逐工作重复查询全部工人状态是 O(n²) 互操作，是卡顿来源之一。
     `FixWallDefensePositions` 不再重复调用 `DisableWallQueueing`（避免与 1s 复钳重复劳动），墙体碰撞体只在 `WallBoundsScanInterval`(5s) 或换岛时重建。
-10. **玩家最高移速 5.8（功能设置页开关「玩家移动速度提升」）**：原版奔跑约 4.29（实测 4.28~4.30 浮动）。开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（2Hz）里执行：
-    ①`player.steed.runSpeed` 不足 `PlayerRunSpeedCap`(5.8) 时写 5.8，并用 `_boostedSteeds` 记录每个坐骑改动前的原值（同一坐骑只记一次）；
-    ②`player.mover._moveSpeed` 落在 [4,5.8) 时抬到 5.8（让当前正在跑的这一段立刻生效）。
-    关闭开关时按记录把 `runSpeed` 还原、并把精确等于 5.8 的 `_moveSpeed` 退回原值，无需重启游戏。
-    只用 [4,5.8) 区间，行走速度（远低于 4）与冲刺/特殊加速（高于 5.8）都不动。如需核对实际速度，临时用 `Player.currentSpeed` 观察，用完删除。
+10. **玩家最高移速 6.3（功能设置页开关「玩家移动速度提升」）**：原版奔跑约 4.29（实测 4.28~4.30 浮动）。开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（2Hz）里执行：
+    ①`player.steed.runSpeed` 不足 `PlayerRunSpeedCap`(6.3) 时写 6.3，并用 `_boostedSteeds` 记录每个坐骑改动前的原值（同一坐骑只记一次）；
+    ②`player.mover._moveSpeed` 落在 [4,6.3) 时抬到 6.3（让当前正在跑的这一段立刻生效）。
+    关闭开关时按记录把 `runSpeed` 还原、并把精确等于 6.3 的 `_moveSpeed` 退回原值，无需重启游戏。
+    只用 [4,6.3) 区间，行走速度（远低于 4）与冲刺/特殊加速（高于 6.3）都不动。`PlayerRunSpeedGuard`(4) 与上限同用一处常量，改速度只需动 `PlayerRunSpeedCap`。如需核对实际速度，临时用 `Player.currentSpeed` 观察，用完删除。
 11. **摇铃立即上船必须延后一帧**（`EmbarkeeInstantBoardPatch`）：不能在 `Embarkee.SetEmbarkableTarget` 的 Postfix 里直接 `Embark()`。
     读档/回岛时 `Boat.ApplyData` / `LoadLegacyEmbarkees` 的恢复顺序是 `StopInert → SetEmbarkableTarget → 游戏自己 Embark()`，Postfix 抢先调用会让同一单位 `Embark` 两次；`Embark()` 先置 `IsEmbarked=true` 再申请座位，重复调用会重复占座，下船时同一单位被处理两次，导致整船 4 弓箭手 + 3 工人卡在码头原地动画，只有重开游戏才恢复。
     正确做法：Postfix 只把单位加入 `FeatureBehaviour._pendingInstantBoards`，Update 下一帧检查 `!IsEmbarked` 且目标仍是船后才 `Embark()`；加载期间（`IsOverlayVisible()==false`）直接清空队列。
@@ -162,6 +169,14 @@
     “回城墙”的目标站位由 `Knight.GetTargetPos()`（读 `rank` 376、`Kingdom.GetGuardPosition`）推导，状态机在行走途中反复评估 `ShouldGoToWall()`；一旦成立就切到 `GoToWall`，中断 `GrabArmor` 协程（`<GrabArmor>d__162.MoveNext` 途中停止，骑士掉头回墙）。
     修复：`KnightKeepArmorGrabPatch` Prefix 在 `_targetArmor != null` 时强制 `ShouldGoToWall` 返回 false（拿到铁剑、目标清空后恢复原生判定）；同时 `DisableWallQueueing` 跳过这类骑士，不改它们的 `rank`。
     `ShouldGoToWall` 没有直接调用者，它是 `StateMachine.AddTransition` 的条件委托（`Archer.ShouldGoToWall(Side)` 是弓箭手的重载，别混淆）。
+17. **时间卡死自愈（`EnsureTimeNotStuck`，每 1 秒采样一次）**：血月结束后游戏可能把 `Director` 时钟倍率留在 0，或时间停止者（`TimeStopper`）未注销，导致时间永久停住（只有重进游戏才恢复）。
+    判据：`director.currentTime` 连续无变化，且 `director.playing`、`Time.timeScale` 正常（排除暂停），且处于红月/黑暗（`enemies.isRedMoon || isDarkness`），且 `enemies.IsDangerous` 为假（无怪物攻城、无待出复波次）——连续 10 秒满足才介入，留出正常波次间隔与收尾演出。
+    第一轮：`director.ResumeTime()` + `enemies.ClearRedMoon()` + `enemies.ClearDarkness()` + `kingdom.CheckBecomeSafe()`（补齐原生收尾）；若再过 10 秒时钟仍不动，第二轮把 `director._timeStoppers` 里的对象逐个 `RemoveTimeStopper`（只注销，不销毁视觉对象）。
+    该逻辑既不写 `isSafe` 也不改时钟倍率以外的状态，避免影响正常血月。
+18. **Plugin 层三个全局补丁**（`Plugin.cs`）：
+    `CursorSystemUpdatePatch`（`CursorSystem.Update` Postfix）：游玩态游戏会隐藏系统光标，MOD 覆盖层需要常显，因此在其 Update 之后补写 `Cursor.visible=true` / `lockState=None`，保证同一帧内 MOD 是最后写入者（在 OnGUI 里写 Cursor 属 IMGUI 阶段，会频闪）。
+    `PlayerReceiveInputPatch`（`Player.IControllable_ReceiveInput` Prefix）：MOD 窗口打开期间返回 false，屏蔽移动/坐骑技能/支付等全部玩家交互，关闭后自动恢复。
+    `TextGeneratorValidatedSettingsPatch`（`TextGenerator.ValidatedSettings` Prefix）：IL2CPP 下 IMGUI 动态字体 `fontSize==0` 时无法生成顶点（中文空白），此时用字体默认字号兜底并重置 `fontStyle`。
 
 ## 5. 未知字段/方法怎么查（逆向工具链）
 
@@ -250,11 +265,15 @@ csproj 需引用：`Cpp2IL.Core`、`LibCpp2IL`、`AssetRipper.Primitives`、`Ass
 
 ## 7. 显示刷新节奏（`MapOverlayBehaviour.Update`）
 
-- 轻刷新 20Hz：玩家位置、怪物竖线/血条、作物条（原 50Hz，纯 CPU 浪费，20Hz 视觉上仍平滑）。
-- 中刷新 2Hz：时间/季节、金币、职业统计。
-- 重刷新 3s（或开关变化触发）：地图标记列表、世界边界（换岛比对后沿用缓存）、悬停动画清理；油桶 8s、农田 5s；洞窟/城堡/坐骑/科技点按本岛一次采集（洞窟未采到前 2.5s 快速重试，最多 8 次）。科技点解锁后只按已记录对象名移除标记，不做全场景重扫。
+- 玩家位置每帧单独刷新（`RefreshPlayerX`）：只读 `kingdom.playerOne` + `transform.position.x`，10Hz 会看出明显跳动。
+- 怪物竖线/血条：跳过 `IsDespawning` 与死亡怪物（`isDead`，或 `hitPoints<=0 && initialHitPoints>0`）——只判 `IsDespawning` 时死亡动画期间标记会继续挂着，看起来“不立刻消失”。
+- 轻刷新 10Hz（`LightRefreshInterval`）：怪物竖线/血条、作物进度。
+- 中频 0.15s（`MediumRefreshInterval`，≈7Hz）：时间/季节、金币、职业统计（含小队弓箭手/高级骑士细分，逐单位读取不再单独降频）、火油桶。
+- 重刷新 3s（或开关变化触发）：地图标记列表、世界边界（换岛比对后沿用缓存）、悬停动画清理；农田/民房 20s、火油桶来源 5s、城墙建造位 30s；洞窟/城堡/坐骑/科技点/雕像/宝箱按本岛一次采集（洞窟未采到前 2.5s 快速重试，最多 8 次）。科技点解锁后只按已记录对象名移除标记，不做全场景重扫。
 - 世界边界与标记列表只在重刷新里更新；`_hoverAnim` **不要每次重刷新清空**（否则悬停标记会周期性缩回再放大），仅在数量 > 512 时清理。
 - 怪物竖线：按 `waveID` 用 `Dictionary<uint, WaveGroup>` 跨帧保留平滑位置与侧别；每帧重算 Min/Max，侧别带 2 只滞回，`Shown` 以 50 世界单位/秒 `MoveTowards` 目标。
+- **火油桶计数**（`RefreshOilBarrels`）不能每次全场景扫描：投石车队列读 `Catapult.queuedOilBarrels`，运送中的桶读 `PayableWorkshopBarrel._activeBarrels` 且跳过 `_delivered`，投石车/工坊对象每 `OilSourceScanInterval`(5s) 缓存一次（`RefreshOilSources`，换岛随 `ResetIslandCaches` 清空）。
+  两个来源在“运送中→已装填”交界处可能同帧不同步（队列已 +1 而桶还没标 delivered，或反之），高频刷新会看到 ±1 闪跳，因此显示值走 `PublishOilCount` 去抖：新值需连续两次采样一致才采纳。
 
 ## 8. 项目工作习惯（必读）
 

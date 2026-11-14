@@ -31,7 +31,7 @@ namespace BetterKingdom
         private const float BankerScanInterval = 3f;    // 银行家（税官）场景查找最小间隔（全场景遍历，两个组件共用一份缓存）
         private const float StationSideCheckInterval = 2f;  // 传送门被毁后的驻守侧改派检测间隔（只在单侧无门时才有写操作）
         private const int HeavySlotGapFrames = 1;           // 两个重型任务之间至少空出的帧数
-        private const float SafeDistance = 20f;         // 避险安全距离：工人位置距该侧城墙外沿（无墙时距主城）超过此值且该侧有怪物出击，就跑回城墙
+        private const float SafeDistance = 15f;         // 避险安全距离：工人位置距该侧城墙外沿（无墙时距主城）超过此值且该侧有怪物出击，就跑回城墙
         private const float PlayerRunSpeedCap = 6.3f;   // 玩家奔跑最高速度：原版约 4.29，这里提升到 6.3
         private const float PlayerRunSpeedGuard = 4f;   // 判定“正在奔跑”的下限
 
@@ -161,9 +161,10 @@ namespace BetterKingdom
             // 安全判定优先占用重型槽位，其余周期任务都可以顺延一帧，威胁检测不能漏
             if (now >= _nextAssaultCheck && TryReserveHeavySlot())
             {
-                // 两侧都已确认有进攻时放宽到 1 秒复查（仍能在怪物撤离后及时恢复接活），
-                // 只有一侧确认时保持 0.3 秒，保证另一侧威胁能被快速发现
-                _nextAssaultCheck = now + ((_attackOnLeft && _attackOnRight) ? 1f : AssaultCheckInterval);
+                // 两侧都已确认有进攻时放宽到 0.5 秒复查（此时敌人数量多，扫描最贵），
+                // 只有一侧确认时保持 0.3 秒；超过这个间隔会让怪物死光后威胁标记多挂一会儿，
+                // 工人白跑一趟回城墙（回跑本身只是症状，真正的延迟在检测节奏上）
+                _nextAssaultCheck = now + ((_attackOnLeft && _attackOnRight) ? 0.5f : AssaultCheckInterval);
                 RefreshSideAssault();
             }
 
@@ -1797,7 +1798,13 @@ namespace BetterKingdom
                 if (e == null || e.IsDespawning) return false;
                 if (e.shouldRetreat) return false;   // 已决定撤回传送门
                 Damageable d = e.damageable;
-                if (d != null && d.isDead) return false;
+                if (d != null)
+                {
+                    if (d.isDead) return false;
+                    // 判定死亡时 isDead 可能晚于血量归零（死亡动画期间仍是 false），
+                    // 只靠 isDead 会让该侧威胁多挂一段时间，工人白跑一趟
+                    try { if (d.hitPoints <= 0 && d.initialHitPoints > 0) return false; } catch { }
+                }
                 if (!e.gameObject.activeSelf) return false;
                 return e.loot == null;   // 捡到金币/战利品逃走的怪物不再算进攻
             }

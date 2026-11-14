@@ -23,13 +23,14 @@ namespace BetterKingdom
         private const float LeftMargin = 16f;
         private const float RightMargin = 260f;
         //   刷新节奏（与 FeatureBehaviour 的重型槽位共用：同一帧最多一个重型任务、且至少隔一帧）  
-        // 轻量：玩家位置/怪物连线/血条，20Hz 足够且视觉平滑（原 50Hz 是纯 CPU 浪费）。
-        // 中频：数值统计类（职业人数/国库/农田），2Hz 足够。
-        // 重型：墙体/箭塔/传送门/额外标记，3 秒一次；额外的全场景扫描进一步拉长间隔并彼此错峰。
+        // 轻刷新（10Hz，最勤）：怪物竖线/血条/作物进度，单项开销小；玩家位置已改为每帧单独读一次。
+        // 中频（≈7Hz）：时间/季节/职业人数/国库/火油桶，数值类信息统一节奏。
+        // 重刷新（3 秒，最慢）：墙体/箭塔/传送门/额外标记等全量重建，开销大所以间隔长；
+        // 其余全场景扫描（洞窟/农田/民房/火油桶来源）进一步错峰，避免同帧叠加重活。
         private const float LightRefreshInterval = 0.1f;
-        private const float MediumRefreshInterval = 0.5f;
+        private const float MediumRefreshInterval = 0.15f;
         private const float HeavyRefreshInterval = 3f;
-        private const float OilScanInterval = 15f;   // 火油桶统计间隔（全场景扫描，仅在职业面板开启时执行）
+        private const float OilSourceScanInterval = 5f;   // 火油桶：运送中桶的来源（工坊）重扫间隔，计数本身跟随中频刷新
         private const float CaveScanRetryInterval = 2.5f;  // 洞窟坐标未采到前的快速重扫间隔（洞窟对象可能晚于边界创建）
         private const int CaveScanMaxRetries = 8;    // 快速重扫次数上限（用尽后本岛不再扫描）
         private const float FarmScanInterval = 20f;  // 农田引用重建间隔（静态关卡对象，全场景扫描不宜过密）
@@ -118,9 +119,15 @@ namespace BetterKingdom
         private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall> _wallScanBuffer;
         private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Tower> _towerScanBuffer;
         private float _nextLightRefresh, _nextMediumRefresh, _nextHeavyRefresh;
-        private float _nextStatDetail;          // 职业细分统计（逐单位扫描）下一次计算时刻
         // 全场景扫描（FindObjectsByType）彼此错峰：集中在一帧执行会形成帧尖峰
-        private float _nextOilScan, _nextCaveScan, _nextFarmScan, _nextHouseScan;
+        private float _nextCaveScan, _nextFarmScan, _nextHouseScan;
+        // 火油桶统计：投石车/工坊对象低频缓存（不再每次刷新都全场景扫描），
+        // 运送中的桶从工坊的 _activeBarrels 读取，因此计数可以跟职业/金币同频刷新
+        private readonly List<Catapult> _oilCatapults = new();
+        private readonly List<PayableWorkshopBarrel> _oilWorkshops = new();
+        private float _nextOilSourceScan;
+        // 火油桶显示值去抖状态（新值需连续两次采样一致才采纳）
+        private int _oilLeftPending, _oilRightPending, _oilLeftHold, _oilRightHold;
         private readonly List<MapMarker> _houseMarkers = new();   // 民房标记（独立列表，避免与难民营互相清空）
         private bool _enemyScanActive;                           // 上一轮是否在扫怪（用于关闭开关时清空一次）
 
@@ -141,9 +148,9 @@ namespace BetterKingdom
         internal static void InvalidateHint() => _hintDirty = true;
         private readonly List<string> _jobLines = new();
 
-        //   怪物扫描复用缓冲（消除 50Hz 下的数组/字典分配）  
+        //   怪物扫描复用缓冲（消除每帧刷新时的数组/字典分配）  
         private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _enemyBuffer;
-        // 中频职业统计复用缓冲（2Hz 刷新时不再每次分配数组）
+        // 中频职业统计复用缓冲（4Hz 刷新时不再每次分配数组）
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer> _archerStatBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Knight> _knightStatBuffer;
         private readonly Dictionary<uint, WaveGroup> _waveGroups = new();   // 按 waveID 分组，跨帧保留同一波的平滑位置
@@ -239,7 +246,7 @@ namespace BetterKingdom
             _styleJob = new GUIStyle { normal = { textColor = Color.white }, fontSize = JobFontSize, alignment = TextAnchor.UpperLeft };
             // 错峰初始化：首帧先做洞窟扫描与重刷新，其余全场景扫描推迟到后续帧
             _nextCaveScan = Time.unscaledTime;
-            _nextOilScan = Time.unscaledTime + 1f;
+            _nextOilSourceScan = Time.unscaledTime;
             _nextFarmScan = Time.unscaledTime + 1f;
         }
 
@@ -280,11 +287,6 @@ namespace BetterKingdom
             {
                 _nextCaveScan = now + CaveScanRetryInterval;
                 RefreshCavePositions();
-            }
-            if (ModWindowBehaviour.ShowClassStats && now >= _nextOilScan && FeatureBehaviour.TryReserveHeavySlot())
-            {
-                _nextOilScan = now + OilScanInterval;
-                RefreshOilBarrels();
             }
             if (now >= _nextFarmScan && FeatureBehaviour.TryReserveHeavySlot())
             {
@@ -398,8 +400,9 @@ namespace BetterKingdom
         }
 
         /// <summary>
-        /// 中频刷新（2Hz）：时间/季节/金币/职业统计等数值信息。
-        /// 这些数值变化慢，2Hz 更新肉眼无感知，集中在此避免高频的 IL2CPP 互操作开销
+        /// 中频刷新（0.15 秒，约 7Hz）：时间/季节/金币/职业统计/火油桶等数值信息。
+        /// 这些数值变化较慢，但玩家对金币、时间与火油桶的跳动敏感，统一到该节奏后观感与轻刷新一致，
+        /// 同时集中在此处理，避免每次 GUI Repaint 都做一遍 IL2CPP 互操作
         /// （职业统计每次都要对全部弓箭手/骑士做一次数组拷贝并逐单位取值）。
         /// </summary>
         private void RefreshMediumData()
@@ -488,10 +491,8 @@ namespace BetterKingdom
                 }
                 catch { }
 
-                // 细分统计：职业面板未开启时不必逐单位读取；开启时也降到 2 秒一次（数值变化慢）
-                float detailNow = Time.unscaledTime;
-                bool wantDetail = ModWindowBehaviour.ShowClassStats && detailNow >= _nextStatDetail;
-                if (wantDetail) _nextStatDetail = detailNow + 2f;
+                // 细分统计：职业面板未开启时不必逐单位读取；开启时跟随中频刷新（单位数量小，逐单位读取开销可控）
+                bool wantDetail = ModWindowBehaviour.ShowClassStats;
 
                 // 细分：骑士小队中的弓箭手（isKnightSoldier=true 表示已被骑士征入小队）
                 // 细分：高级骑士（用铁剑晋升、tag 为 Knight 的骑士；_wasPromoted 只标记被回收的旧侍从，不能用于区分）
@@ -539,6 +540,9 @@ namespace BetterKingdom
                     }
                     catch { }
                 }
+
+                // 火油桶统计与职业/金币同频：投石车队列来自王国列表，运送中的桶来自工坊缓存集合
+                if (ModWindowBehaviour.ShowClassStats) RefreshOilBarrels();
 
                 RebuildDisplayStrings();
             }
@@ -615,41 +619,48 @@ namespace BetterKingdom
                     Enemy e = _enemyBuffer[i];
                     if (e == null) continue;
                     try { if (e.IsDespawning) continue; } catch { }
+                    // 已死亡的怪物必须立刻从标记里剔除：只跳过 IsDespawning 时，
+                    // 死亡到对象真正回收之间还有一段死亡动画，这段时间竖线/血条会继续留着，
+                    // 表现为“怪物已经死了，地图标记还挂着不消失”
+                    Damageable dmg = null;
+                    try { dmg = e.damageable; } catch { }
+                    if (dmg == null) { try { dmg = e.Damageable; } catch { } }
+                    if (dmg != null)
+                    {
+                        bool dead = false;
+                        try { dead = dmg.isDead; } catch { }
+                        if (!dead)
+                        {
+                            // isDead 可能晚于血量归零（死亡动画期间仍为 false），血量已空即视为死亡
+                            try { dead = dmg.hitPoints <= 0 && dmg.initialHitPoints > 0; } catch { }
+                        }
+                        if (dead) continue;
+                    }
                     if (!TryGetX(e, out float x)) continue;
 
                     // 怪物血条：优先 hitPoints/initialHitPoints 算比例，悬浮在头顶；仅受伤（血量不满）时显示
-                    if (collectHp)
+                    if (collectHp && dmg != null)
                     {
                         try
                         {
-                            Damageable d = e.damageable;
-                            if (d == null) { try { d = e.Damageable; } catch { } }
-                            if (d != null)
+                            int hp = -1, init = -1;
+                            try { hp = dmg.hitPoints; } catch { }
+                            try { init = dmg.initialHitPoints; } catch { }
+                            float frac = -1f;
+                            if (init > 0 && hp > 0 && hp < init)
+                                frac = (float)hp / init;
+                            else
                             {
-                                bool dead = false;
-                                try { dead = d.isDead; } catch { }
-                                if (!dead)
+                                // 部分怪物无整数血量字段（initialHitPoints 为 0），回退用百分比属性
+                                try
                                 {
-                                    int hp = -1, init = -1;
-                                    try { hp = d.hitPoints; } catch { }
-                                    try { init = d.initialHitPoints; } catch { }
-                                    float frac = -1f;
-                                    if (init > 0 && hp > 0 && hp < init)
-                                        frac = (float)hp / init;
-                                    else
-                                    {
-                                        // 部分怪物无整数血量字段（initialHitPoints 为 0），回退用百分比属性
-                                        try
-                                        {
-                                            float p = d.HealthPercentage;
-                                            if (p > 0f && p < 1f) frac = p;
-                                        }
-                                        catch { }
-                                    }
-                                    if (frac >= 0f)
-                                        _hpBars.Add(new WorldBar { Pos = e.transform.position + new Vector3(0f, HpBarWorldOffsetY, 0f), Frac = frac });
+                                    float p = dmg.HealthPercentage;
+                                    if (p > 0f && p < 1f) frac = p;
                                 }
+                                catch { }
                             }
+                            if (frac >= 0f)
+                                _hpBars.Add(new WorldBar { Pos = e.transform.position + new Vector3(0f, HpBarWorldOffsetY, 0f), Frac = frac });
                         }
                         catch { }
                     }
@@ -717,7 +728,7 @@ namespace BetterKingdom
                 // 城堡位置：本岛第一次读到后即记住，之后不再刷新（换岛时由 ResetIslandCaches 清空重读）
                 if (!_hasCastle) _hasCastle = TryGetX(kingdom.castle, out _castleX);
 
-                // 火油桶统计已独立成 4 秒定时任务（见 Update 的 OilScanInterval），不再放进重刷新
+                // 火油桶统计已并入中频刷新（RefreshMediumData → RefreshOilBarrels），不再放进重刷新
 
                 _portalX.Clear();
                 _wallX.Clear();
@@ -874,6 +885,10 @@ namespace BetterKingdom
             // 雕像/宝箱/城墙建造位：本岛重新采集一次
             _statuesScanned = false;
             _statueSources.Clear();
+            // 火油桶来源（投石车/工坊）：换岛后重新扫描
+            _oilCatapults.Clear();
+            _oilWorkshops.Clear();
+            _nextOilSourceScan = Time.unscaledTime;
             _chestsScanned = false;
             _chestSources.Clear();
             _wallSitesScanned = false;
@@ -1079,42 +1094,95 @@ namespace BetterKingdom
 
         /// <summary>
         /// 统计两侧火油桶：投石车已装填队列（Catapult.queuedOilBarrels）
-        /// + 运送中未送达的桶（RollableOilBarrel 未 delivered），按 Catapult.side/RollableOilBarrel.side 分侧。
+        /// + 运送中未送达的桶（RollableOilBarrel 未 delivered），按 side 分侧。
+        /// 不做全场景扫描：投石车与工坊对象每 OilSourceScanInterval 缓存一次，
+        /// 运送中的桶从工坊的 _activeBarrels 集合读取，因此可以与职业/金币同频刷新。
+        /// 计数分两段来源，桶从“运送中”转为“已装填”时两段在同一帧内不一定同步
+        /// （队列已 +1 而集合里的桶还没标 delivered，或反过来），直接显示会在交界处闪跳 ±1，
+        /// 所以显示值用 PublishOilCount 做去抖：新值需连续两次采样一致才采纳。
         /// </summary>
         private void RefreshOilBarrels()
         {
-            _oilLeft = 0;
-            _oilRight = 0;
+            int rawLeft = 0, rawRight = 0;
+            RefreshOilSources();
             try
             {
                 // 投石车已装填的火油桶队列
-                var catapults = UnityEngine.Object.FindObjectsByType<Catapult>(FindObjectsSortMode.None);
-                foreach (Catapult cat in catapults)
+                for (int i = 0; i < _oilCatapults.Count; i++)
                 {
+                    Catapult cat = _oilCatapults[i];
                     if (cat == null) continue;
                     try
                     {
                         int queued = cat.queuedOilBarrels;
                         if (queued <= 0) continue;
-                        if (cat.side == Side.Left) _oilLeft += queued;
-                        else if (cat.side == Side.Right) _oilRight += queued;
+                        Side catSide = cat.side;
+                        if (catSide == Side.Left) rawLeft += queued;
+                        else if (catSide == Side.Right) rawRight += queued;
                     }
                     catch { }
                 }
 
                 // 运送中（工人正在滚动、尚未送达投石车）的火油桶
-                var rollables = UnityEngine.Object.FindObjectsByType<RollableOilBarrel>(FindObjectsSortMode.None);
-                foreach (RollableOilBarrel barrel in rollables)
+                // 已装填（_delivered=true）的桶由投石车队列统计，这里跳过，避免重复计数
+                for (int i = 0; i < _oilWorkshops.Count; i++)
                 {
-                    if (barrel == null) continue;
+                    PayableWorkshopBarrel workshop = _oilWorkshops[i];
+                    if (workshop == null) continue;
+                    Il2CppSystem.Collections.Generic.HashSet<RollableOilBarrel> barrels = null;
+                    try { barrels = workshop._activeBarrels; } catch { }
+                    if (barrels == null) continue;
+                    Side side;
+                    try { side = workshop.side; } catch { continue; }
                     try
                     {
-                        if (barrel._delivered) continue;
-                        if (barrel.side == Side.Left) _oilLeft++;
-                        else if (barrel.side == Side.Right) _oilRight++;
+                        foreach (RollableOilBarrel barrel in barrels)
+                        {
+                            if (barrel == null) continue;
+                            try { if (barrel._delivered) continue; } catch { }
+                            if (side == Side.Left) rawLeft++;
+                            else if (side == Side.Right) rawRight++;
+                        }
                     }
                     catch { }
                 }
+            }
+            catch { }
+
+            PublishOilCount(ref _oilLeft, ref _oilLeftPending, ref _oilLeftHold, rawLeft);
+            PublishOilCount(ref _oilRight, ref _oilRightPending, ref _oilRightHold, rawRight);
+        }
+
+        /// <summary>火油桶显示值去抖：新值连续两次采样一致才采纳，过滤运送/装填交界处的 1~2 帧闪跳。</summary>
+        private static void PublishOilCount(ref int shown, ref int pending, ref int hold, int raw)
+        {
+            if (raw == shown) { pending = raw; hold = 0; return; }
+            if (raw != pending) { pending = raw; hold = 0; return; }
+            if (++hold < 2) return;
+            shown = raw;
+            hold = 0;
+        }
+
+        /// <summary>火油桶统计的来源缓存：投石车与工坊对象都是建造后才出现，低频重扫即可。</summary>
+        private void RefreshOilSources()
+        {
+            float now = Time.unscaledTime;
+            if (now < _nextOilSourceScan) return;
+            _nextOilSourceScan = now + OilSourceScanInterval;
+            _oilCatapults.Clear();
+            _oilWorkshops.Clear();
+            try
+            {
+                var catapults = UnityEngine.Object.FindObjectsByType<Catapult>(FindObjectsSortMode.None);
+                if (catapults != null)
+                    for (int i = 0; i < catapults.Length; i++) if (catapults[i] != null) _oilCatapults.Add(catapults[i]);
+            }
+            catch { }
+            try
+            {
+                var workshops = UnityEngine.Object.FindObjectsByType<PayableWorkshopBarrel>(FindObjectsSortMode.None);
+                if (workshops != null)
+                    for (int i = 0; i < workshops.Length; i++) if (workshops[i] != null) _oilWorkshops.Add(workshops[i]);
             }
             catch { }
         }
@@ -1128,7 +1196,7 @@ namespace BetterKingdom
 
         /// <summary>
         /// 农田引用与位置缓存重建（低频）：仅在开关开启时扫描；位置在扫描时读一次并缓存，
-        /// 轻刷新不再反复读取 transform（每次读取都会生成包装对象，是 20Hz 下的主要分配来源）。
+        /// 轻刷新不再反复读取 transform（每次读取都会生成包装对象，是高频刷新下的主要分配来源）。
         /// </summary>
         private void RefreshFarmlandRefs()
         {
